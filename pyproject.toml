@@ -1,0 +1,27 @@
+[project]
+name = "cfr"
+version = "0.1.0"
+description = "Local-first Feishu bridge for the native Codex runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+
+[project.scripts]
+cfr = "cfr.cli.main:cli"
+
+[project.optional-dependencies]
+feishu = [
+    "lark-channel-sdk>=1,<2",
+    "lark-oapi>=1.5.5,<2",
+    "keyring>=25,<26",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

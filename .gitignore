@@ -1,0 +1,34 @@
+# Local runtime and diagnostic artifacts
+.tmp/
+experiments/
+*.sqlite3
+CFR_SOURCE_SNAPSHOT_*.zip
+.env
+.env.*
+!.env.example
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.log
+
+# Control Center build artifacts
+m3_control/node_modules/
+m3_control/dist/
+*.tsbuildinfo
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

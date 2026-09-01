@@ -1,0 +1,11 @@
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.cmd text eol=crlf
+docs/reference/CFR_AND_BROKER_COEXISTENCE_ROUTING_CONTRACT_v1.2.md whitespace=-trailing-space,-blank-at-eof

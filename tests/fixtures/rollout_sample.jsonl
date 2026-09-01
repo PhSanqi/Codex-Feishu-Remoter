@@ -1,0 +1,2 @@
+{"type":"event_msg","payload":{"type":"user_message","thread_id":"fixture-thread","turn_id":"fixture-turn-1","id":"fixture-item-user","message":"CFR fixture user message"}}
+{"type":"event_msg","payload":{"type":"agent_message","thread_id":"fixture-thread","turn_id":"fixture-turn-1","id":"fixture-item-agent","message":"CFR fixture agent message"}}
