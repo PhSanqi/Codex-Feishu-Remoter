@@ -1,0 +1,16 @@
+[Unit]
+Description=CFR local-first Feishu / Codex / Chat control runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/codex-workspace/CFR
+ExecStart=%h/codex-workspace/CFR/START_CFR.sh --quiet
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

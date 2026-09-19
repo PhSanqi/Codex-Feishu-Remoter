@@ -39,7 +39,15 @@ class WriterLeaseManager:
 
     def release(self, thread_id: str) -> None:
         with self._lock:
-            self._states[thread_id] = LeaseState.IDLE
+            self._states.pop(thread_id, None)
+
+    def busy_threads(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(
+                thread_id
+                for thread_id, state in self._states.items()
+                if state is not LeaseState.IDLE
+            )
 
 
 class WriterLease:

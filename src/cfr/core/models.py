@@ -274,7 +274,7 @@ class TurnTelemetry:
             'FEISHU_FINAL_DELIVERY': metrics['final_delivery_ms'],
         }
         available = {name: value for name, value in phases.items() if value is not None}
-        return max(available, key=available.get) if available else 'UNKNOWN'
+        return max(available, key=lambda name: available[name]) if available else 'UNKNOWN'
 
     def snapshot(self, *, now=None, wall_now=None):
         now = time.monotonic() if now is None else now

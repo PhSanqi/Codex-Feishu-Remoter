@@ -314,6 +314,21 @@ def prepare_channel_sdk_runtime() -> ChannelSdkLoopDiagnostic:
     return diagnostic
 
 
+def close_idle_channel_sdk_loop(module: ModuleType | None = None) -> bool:
+    """Close the SDK import-time loop only when it has no owner or tasks."""
+    module = module or importlib.import_module('lark_channel.ws.client')
+    loop = getattr(module, 'loop', None)
+    if loop is None or loop.is_running() or loop.is_closed():
+        return False
+    try:
+        if any(not task.done() for task in asyncio.all_tasks(loop)):
+            return False
+        loop.close()
+        return True
+    except Exception:
+        return False
+
+
 def _coroutine_origin(coro) -> tuple[str, str, str]:
     """Resolve a real coroutine's defining module, qualname, and filename."""
     frame = getattr(coro, 'cr_frame', None)

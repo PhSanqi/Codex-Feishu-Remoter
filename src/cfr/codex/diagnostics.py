@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import json
 import re
 import subprocess
@@ -13,8 +14,10 @@ from typing import Any, Mapping
 
 from .launcher import CodexLauncher
 from .app_server import AppServerClient
+from .approvals import CFR_ACCOUNTED_SERVER_REQUEST_METHODS, CFR_REQUIRED_SERVER_REQUEST_METHODS
 from ..config import child_process_env, resolve_cfr_codex_home
 from ..network import sanitized_proxy_url
+from ..platform import hidden_subprocess_kwargs
 
 
 _ROUTING_KEYS = {
@@ -53,6 +56,7 @@ class CodexInterfaceCapabilities:
     collaboration_mode_list: bool
     thread_status_shape: tuple[str, ...]
     turn_status_shape: tuple[str, ...]
+    server_request_methods: tuple[str, ...]
 
 
 _REQUIRED_CFR_APP_SERVER_METHODS = {
@@ -71,6 +75,7 @@ _REQUIRED_CFR_APP_SERVER_METHODS = {
 def codex_interface_capabilities(schema_path: str | Path, codex_version: str | None = None) -> CodexInterfaceCapabilities:
     """Parse generated local app-server schema; never probes or mutates a server."""
     path = Path(schema_path)
+    schema_root = path if path.is_dir() else path.parent
     if path.is_dir():
         candidates = (
             path / 'codex_app_server_protocol.v2.schemas.json',
@@ -98,6 +103,25 @@ def codex_interface_capabilities(schema_path: str | Path, codex_version: str | N
 
     methods = set(literals(schema))
     definitions = schema.get('definitions', {}) if isinstance(schema, Mapping) else {}
+
+    def server_request_methods():
+        request_path = schema_root / 'ServerRequest.json'
+        try:
+            request_schema = json.loads(request_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return ()
+        methods = []
+        for branch in request_schema.get('oneOf', ()) if isinstance(request_schema, Mapping) else ():
+            if not isinstance(branch, Mapping):
+                continue
+            method_schema = (branch.get('properties') or {}).get('method') or {}
+            values = []
+            if isinstance(method_schema, Mapping):
+                if isinstance(method_schema.get('const'), str):
+                    values.append(method_schema['const'])
+                values.extend(value for value in (method_schema.get('enum') or ()) if isinstance(value, str))
+            methods.extend(values)
+        return tuple(dict.fromkeys(methods))
 
     def status_values(name):
         definition = definitions.get(name, {}) if isinstance(definitions, Mapping) else {}
@@ -131,6 +155,7 @@ def codex_interface_capabilities(schema_path: str | Path, codex_version: str | N
         collaboration_mode_list='collaborationMode/list' in methods,
         thread_status_shape=status_values('ThreadStatus'),
         turn_status_shape=status_values('TurnStatus'),
+        server_request_methods=server_request_methods(),
     )
 
 
@@ -142,6 +167,36 @@ def missing_required_app_server_methods(capabilities: CodexInterfaceCapabilities
         for method, field in _REQUIRED_CFR_APP_SERVER_METHODS.items()
         if not getattr(capabilities, field)
     )
+
+
+def missing_required_server_requests(capabilities: CodexInterfaceCapabilities) -> tuple[str, ...]:
+    if not capabilities.generated_schema:
+        return ()
+    present = set(capabilities.server_request_methods)
+    return tuple(sorted(CFR_REQUIRED_SERVER_REQUEST_METHODS - present))
+
+
+def unaccounted_server_requests(capabilities: CodexInterfaceCapabilities) -> tuple[str, ...]:
+    return tuple(sorted(set(capabilities.server_request_methods) - CFR_ACCOUNTED_SERVER_REQUEST_METHODS))
+
+
+def _schema_fingerprint(directory: str | Path) -> str | None:
+    root = Path(directory)
+    if not root.is_dir():
+        return None
+    digest = hashlib.sha256()
+    found = False
+    for path in sorted(root.glob('*.json'), key=lambda value: value.name.casefold()):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        found = True
+        digest.update(path.name.encode('utf-8'))
+        digest.update(b'\0')
+        digest.update(data)
+        digest.update(b'\0')
+    return digest.hexdigest() if found else None
 
 
 def normalize_gate_origin(value: str | None) -> str:
@@ -275,6 +330,8 @@ def login_status(launcher: CodexLauncher, process_env: Mapping[str, str] | None 
             errors='replace',
             timeout=15,
             env={**os.environ, **process_env} if process_env else None,
+            check=False,
+            **hidden_subprocess_kwargs(),
         )
         output = f'{completed.stdout}\n{completed.stderr}'
         auth_mode = classify_login_output(output)
@@ -397,18 +454,43 @@ def config_schema_snapshot(launcher: CodexLauncher, codex_version: str | None = 
                 ('standard', ('app-server', 'generate-json-schema', '--out', directory)),
             ):
                 command = launcher.build_command(*args)
-                completed = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=20)
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    timeout=20,
+                    check=False,
+                    **hidden_subprocess_kwargs(),
+                )
                 if completed.returncode == 0:
                     mode = label
                     break
             capabilities = codex_interface_capabilities(directory, codex_version) if completed.returncode == 0 else None
             missing = missing_required_app_server_methods(capabilities) if capabilities is not None else ()
+            missing_server_requests = missing_required_server_requests(capabilities) if capabilities is not None else ()
+            unaccounted_requests = unaccounted_server_requests(capabilities) if capabilities is not None else ()
+            inbound_compatible = bool(
+                capabilities
+                and capabilities.generated_schema
+                and capabilities.server_request_methods
+                and not missing_server_requests
+                and not unaccounted_requests
+            )
+            fingerprint = _schema_fingerprint(directory) if completed.returncode == 0 else None
             return {
                 'SchemaCommandSucceeded': completed.returncode == 0,
                 'SchemaCommandMode': mode,
                 'GeneratedSchema': bool(capabilities and capabilities.generated_schema),
-                'RequiredMethodsAvailable': bool(capabilities and capabilities.generated_schema and not missing),
+                'SchemaFingerprint': fingerprint,
+                'RequiredClientMethodsAvailable': bool(capabilities and capabilities.generated_schema and not missing),
+                'InboundServerRequestsCompatible': inbound_compatible,
+                'RequiredMethodsAvailable': bool(capabilities and capabilities.generated_schema and not missing and inbound_compatible),
                 'MissingRequiredMethods': list(missing),
+                'MissingRequiredServerRequests': list(missing_server_requests),
+                'UnaccountedServerRequests': list(unaccounted_requests),
+                'ServerRequestMethods': list(capabilities.server_request_methods) if capabilities is not None else [],
                 'Capabilities': capabilities.__dict__ if capabilities is not None else None,
             }
     except Exception as exc:

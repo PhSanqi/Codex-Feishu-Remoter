@@ -1,9 +1,12 @@
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tomllib
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -43,6 +46,50 @@ class CliBootstrapTests(unittest.TestCase):
         sys.path.insert(0, str(ROOT / 'src'))
         from cfr.cli.main import cli
         self.assertTrue(callable(cli))
+
+    def test_noninteractive_cli_server_request_fails_closed_instead_of_auto_approving(self):
+        sys.path.insert(0, str(ROOT / 'src'))
+        from cfr.cli.main import _console_server_request
+        request = {
+            'id': 1,
+            'method': 'item/permissions/requestApproval',
+            'params': {
+                'threadId': 'thread-1', 'turnId': 'turn-1', 'itemId': 'item-1',
+                'permissions': {'network': {'enabled': True}},
+            },
+        }
+        with patch('cfr.cli.main.sys.stdin.isatty', return_value=False):
+            result = _console_server_request(request)
+        self.assertEqual(result, {'permissions': {}, 'scope': 'turn'})
+
+    def test_watch_runs_best_effort_event_dedupe_retention_before_polling(self):
+        sys.path.insert(0, str(ROOT / 'src'))
+        from cfr.cli.main import _watch
+
+        store = SimpleNamespace(
+            prune_event_dedupe=Mock(),
+            get_binding=Mock(return_value=SimpleNamespace(rollout_path=ROOT / 'rollout.jsonl', last_rollout_byte_offset=0)),
+            update_rollout_offset=Mock(),
+        )
+        watcher = SimpleNamespace(poll=lambda: [], byte_offset=0)
+        with patch('cfr.cli.main.RolloutWatcher', return_value=watcher):
+            _watch(store, 'thread-1', 0, True)
+        store.prune_event_dedupe.assert_called_once_with()
+        store.update_rollout_offset.assert_called_once_with('thread-1', 0)
+
+    def test_watch_still_starts_when_event_dedupe_retention_hits_transient_sqlite_error(self):
+        sys.path.insert(0, str(ROOT / 'src'))
+        from cfr.cli.main import _watch
+
+        store = SimpleNamespace(
+            prune_event_dedupe=Mock(side_effect=sqlite3.OperationalError('busy')),
+            get_binding=Mock(return_value=SimpleNamespace(rollout_path=ROOT / 'rollout.jsonl', last_rollout_byte_offset=0)),
+            update_rollout_offset=Mock(),
+        )
+        watcher = SimpleNamespace(poll=lambda: [], byte_offset=0)
+        with patch('cfr.cli.main.RolloutWatcher', return_value=watcher):
+            _watch(store, 'thread-1', 0, True)
+        store.update_rollout_offset.assert_called_once_with('thread-1', 0)
 
 
 if __name__ == '__main__':

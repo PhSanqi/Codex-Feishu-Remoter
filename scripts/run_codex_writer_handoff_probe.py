@@ -2,7 +2,6 @@ import argparse
 import json
 import platform
 import re
-import shutil
 import subprocess
 import time
 import uuid

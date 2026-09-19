@@ -2,12 +2,13 @@ import asyncio
 import logging
 from pathlib import Path
 import queue
+import sys
 import time
 import uuid
 
 from cfr.config import child_process_env, resolve_cfr_codex_home
-from cfr.core.models import ConversationResult, StructuredError, ThreadRef, TurnResult, TurnTelemetry
-from cfr.network import proxy_child_env, resolve_proxy
+from cfr.core.models import ConversationResult, StructuredError, ThreadRef, TurnResult
+from cfr.network import proxy_child_env, resolve_cfr_proxy
 
 from .app_server import AppServerClient, AppServerRpcError
 from .lease import LeaseState, WriterLeaseManager
@@ -31,7 +32,7 @@ class CodexAdapter:
         self.launcher = launcher
         self.timeout = timeout
         self.turn_timeout = turn_timeout
-        self.process_env = dict(process_env) if process_env is not None else dict(proxy_child_env(resolve_proxy()) or {})
+        self.process_env = dict(process_env) if process_env is not None else dict(proxy_child_env(resolve_cfr_proxy()) or {})
         self.config_overrides = config_overrides
         self.resolved_cfr_codex_home = resolve_cfr_codex_home(codex_home)
         self.leases = WriterLeaseManager()
@@ -65,7 +66,7 @@ class CodexAdapter:
             if value is not None:
                 telemetry.mark(name, at=value, wall_at=now_wall - (now_mono - value))
 
-    def _client(self, on_server_request=None):
+    def _client(self, on_server_request=None, on_server_notification=None):
         options = dict(
             launcher=self.launcher,
             timeout=self.timeout,
@@ -75,7 +76,15 @@ class CodexAdapter:
         )
         if on_server_request is not None:
             options['on_server_request'] = on_server_request
+        if on_server_notification is not None:
+            options['on_server_notification'] = on_server_notification
         return AppServerClient(**options)
+
+    def _release_runtime_lease(self, lease):
+        if lease is None or self.runtime_leases is None:
+            return
+        if not self.runtime_leases.release(lease):
+            raise StructuredError('CFR_RUNTIME_LEASE_RELEASE_FAILED', f'Could not release runtime lease for {lease.thread_id}')
 
     @staticmethod
     def _thread_from_read(result, fallback):
@@ -98,6 +107,18 @@ class CodexAdapter:
         if settings and self.store:
             self.store.update_observed_settings(thread_id, settings)
         return settings
+
+    @staticmethod
+    def _resume_bound_thread(manager, thread_id, *, settings=None):
+        """Resume a selected durable thread, restoring it if Desktop archived it."""
+        try:
+            return manager.resume_thread(thread_id, settings=settings)
+        except AppServerRpcError as exc:
+            if 'is archived' not in exc.message.lower():
+                raise
+            manager.unarchive_thread(thread_id)
+            LOGGER.info('CFR_THREAD_AUTO_UNARCHIVED thread=%s', thread_id)
+            return manager.resume_thread(thread_id, settings=settings)
 
     def _projected_settings(self, thread_id):
         if not self.store:
@@ -122,7 +143,7 @@ class CodexAdapter:
         if turn.status != 'completed':
             raise StructuredError(f'{operation.upper()}_TURN_{turn.status.upper()}', f'{operation} turn ended with {turn.status}', turn)
 
-    async def create_conversation(self, cwd: Path, name: str, initial_message: str, *, on_server_request=None, on_progress=None, telemetry=None):
+    async def create_conversation(self, cwd: Path, name: str, initial_message: str, *, on_server_request=None, on_server_notification=None, on_progress=None, telemetry=None, attachments=None, thread_settings=None):
         telemetry = self._turn_telemetry(telemetry)
         def run():
             client = None
@@ -130,14 +151,17 @@ class CodexAdapter:
                 telemetry.mark('task_execution_started_at')
                 telemetry.mark('runtime_acquire_started_at')
                 telemetry.mark('runtime_acquired_at')
-                client = self._client(on_server_request=on_server_request)
+                client = self._client(on_server_request=on_server_request, on_server_notification=on_server_notification)
                 client.start()
                 self._observe_client_start(telemetry, client)
                 manager = ThreadManager(client)
-                initial = manager.create_thread(Path(cwd), name)
+                initial = manager.create_thread(Path(cwd), name, settings=thread_settings)
                 telemetry.set_identity(thread_id=initial.thread_id)
                 telemetry.set_runtime_settings(manager.last_create_result)
-                turn = TurnManager(client, self.registry).run_turn(initial.thread_id, initial_message, turn_timeout=self.turn_timeout, on_progress=on_progress, telemetry=telemetry)
+                turn = TurnManager(client, self.registry).run_turn(
+                    initial.thread_id, initial_message, turn_timeout=self.turn_timeout,
+                    on_progress=on_progress, telemetry=telemetry, attachments=attachments,
+                )
                 telemetry.mark('runtime_cleanup_started_at')
                 self._ensure_completed(turn, 'initial')
                 read = manager.read_thread(initial.thread_id)
@@ -159,16 +183,27 @@ class CodexAdapter:
                     telemetry.set_stage('failed', status='failed', event='CFR runtime failed')
                 raise
             finally:
+                had_error = sys.exc_info()[0] is not None
+                cleanup_error = None
                 telemetry.mark('runtime_cleanup_started_at')
                 if client is not None:
-                    client.close()
-                    self.last_client_lifecycle = client.lifecycle_snapshot()
+                    try:
+                        client.close()
+                    except Exception as error:
+                        cleanup_error = error
+                    finally:
+                        try:
+                            self.last_client_lifecycle = client.lifecycle_snapshot()
+                        except Exception as error:
+                            cleanup_error = cleanup_error or error
                 telemetry.mark('runtime_cleanup_completed_at')
                 self.registry.observe(telemetry)
+                if cleanup_error is not None and not had_error:
+                    raise cleanup_error
 
         return await asyncio.to_thread(run)
 
-    async def send_message(self, thread_id: str, message: str, *, on_server_request=None, on_progress=None, telemetry=None):
+    async def send_message(self, thread_id: str, message: str, *, on_server_request=None, on_server_notification=None, on_progress=None, telemetry=None, attachments=None, permission_settings=None):
         telemetry = self._turn_telemetry(telemetry, thread_id=thread_id)
         def run():
             telemetry.mark('task_execution_started_at')
@@ -184,25 +219,42 @@ class CodexAdapter:
                 try:
                     self.runtime_leases.start_heartbeat(durable_lease)
                 except Exception:
-                    self.runtime_leases.release(durable_lease)
+                    self._release_runtime_lease(durable_lease)
                     raise
             if self.leases.state_for(thread_id) is not LeaseState.EXTERNAL_ACTIVE:
                 try:
                     self.leases.acquire(thread_id)
                 except Exception:
                     if durable_lease and self.runtime_leases:
-                        self.runtime_leases.release(durable_lease)
+                        self._release_runtime_lease(durable_lease)
                     raise
             telemetry.mark('runtime_acquired_at')
             client = None
+            persisted_turn_id = None
+
+            def project_progress(values):
+                nonlocal persisted_turn_id
+                turn_id = (values or {}).get('turn_id')
+                if turn_id and turn_id != persisted_turn_id:
+                    try:
+                        self.store.set_active_turn(thread_id, turn_id, LeaseState.CFR_ACTIVE.value)
+                        persisted_turn_id = turn_id
+                    except Exception as error:
+                        LOGGER.warning('CODEX_BINDING_ACTIVE_TURN_PROJECTION_FAILED thread=%s type=%s', thread_id, type(error).__name__)
+                if on_progress is not None:
+                    on_progress(values)
             try:
-                client = self._client(on_server_request=on_server_request)
+                try:
+                    self.store.set_writer_state(thread_id, LeaseState.CFR_ACTIVE.value)
+                except Exception as error:
+                    LOGGER.warning('CODEX_BINDING_WRITER_PROJECTION_FAILED thread=%s type=%s', thread_id, type(error).__name__)
+                client = self._client(on_server_request=on_server_request, on_server_notification=on_server_notification)
                 client.start()
                 self._observe_client_start(telemetry, client)
                 manager = ThreadManager(client)
                 try:
                     telemetry.mark('thread_resume_started_at')
-                    resumed = manager.resume_thread(thread_id)
+                    resumed = self._resume_bound_thread(manager, thread_id, settings=permission_settings)
                     telemetry.mark('thread_resume_completed_at')
                 except AppServerRpcError as exc:
                     if 'active writer' in exc.message.lower():
@@ -222,7 +274,10 @@ class CodexAdapter:
                 self.leases.recover(thread_id)
                 if durable_lease and durable_lease.lease_lost:
                     raise StructuredError('CFR_RUNTIME_LEASE_LOST', f'Lease lost for {thread_id}')
-                turn = TurnManager(client, self.registry).run_turn(thread_id, message, turn_timeout=self.turn_timeout, on_progress=on_progress, telemetry=telemetry)
+                turn = TurnManager(client, self.registry).run_turn(
+                    thread_id, message, turn_timeout=self.turn_timeout,
+                    on_progress=project_progress, telemetry=telemetry, attachments=attachments,
+                )
                 telemetry.mark('runtime_cleanup_started_at')
                 if durable_lease and durable_lease.lease_lost:
                     raise StructuredError('CFR_RUNTIME_LEASE_LOST', f'Lease lost for {thread_id}')
@@ -234,18 +289,37 @@ class CodexAdapter:
                     telemetry.set_stage('failed', status='failed', event='CFR runtime failed')
                 raise
             finally:
+                had_error = sys.exc_info()[0] is not None
+                cleanup_error = None
                 telemetry.mark('runtime_cleanup_started_at')
                 state = self.leases.state_for(thread_id)
                 if client is not None:
-                    client.close()
-                    self.last_client_lifecycle = client.lifecycle_snapshot()
-                self.store.clear_active_turn(thread_id, state.value if state is not LeaseState.CFR_ACTIVE else LeaseState.IDLE.value)
-                if state is LeaseState.CFR_ACTIVE:
-                    self.leases.release(thread_id)
-                if durable_lease and self.runtime_leases:
-                    self.runtime_leases.release(durable_lease)
+                    try:
+                        client.close()
+                    except Exception as error:
+                        cleanup_error = error
+                    finally:
+                        try:
+                            self.last_client_lifecycle = client.lifecycle_snapshot()
+                        except Exception as error:
+                            cleanup_error = cleanup_error or error
+                try:
+                    self.store.clear_active_turn(thread_id, state.value if state is not LeaseState.CFR_ACTIVE else LeaseState.IDLE.value)
+                except Exception as error:
+                    cleanup_error = cleanup_error or error
+                    LOGGER.warning('CODEX_BINDING_CLEANUP_FAILED thread=%s type=%s', thread_id, type(error).__name__)
+                finally:
+                    if state is LeaseState.CFR_ACTIVE:
+                        self.leases.release(thread_id)
+                    if durable_lease and self.runtime_leases:
+                        try:
+                            self._release_runtime_lease(durable_lease)
+                        except Exception as error:
+                            cleanup_error = cleanup_error or error
                 telemetry.mark('runtime_cleanup_completed_at')
                 self.registry.observe(telemetry)
+                if cleanup_error is not None and not had_error:
+                    raise cleanup_error
 
         return await asyncio.to_thread(run)
 
@@ -285,11 +359,15 @@ class CodexAdapter:
                 try:
                     self.runtime_leases.start_heartbeat(durable_lease)
                 except Exception:
-                    self.runtime_leases.release(durable_lease)
+                    self._release_runtime_lease(durable_lease)
                     raise
             self.leases.acquire(thread_id)
             client = None
             try:
+                try:
+                    self.store.set_writer_state(thread_id, LeaseState.CFR_ACTIVE.value)
+                except Exception as error:
+                    LOGGER.warning('CODEX_BINDING_WRITER_PROJECTION_FAILED thread=%s type=%s', thread_id, type(error).__name__)
                 client = self._client()
                 client.start()
                 _settings_timing('APP_SERVER_START', elapsed_ms=getattr(client, 'app_server_start_elapsed_ms', 0) or 0)
@@ -297,7 +375,7 @@ class CodexAdapter:
                 manager = ThreadManager(client)
                 try:
                     phase_started = time.monotonic()
-                    resumed = manager.resume_thread(thread_id)
+                    resumed = self._resume_bound_thread(manager, thread_id)
                     _settings_timing('THREAD_RESUME', phase_started)
                 except AppServerRpcError as exc:
                     if 'active writer' in exc.message.lower():
@@ -350,22 +428,37 @@ class CodexAdapter:
                 projection['result'] = result
                 return projection
             finally:
+                had_error = sys.exc_info()[0] is not None
+                cleanup_error = None
                 state = self.leases.state_for(thread_id)
-                try:
-                    if client is not None:
-                        phase_started = time.monotonic()
+                if client is not None:
+                    phase_started = time.monotonic()
+                    try:
+                        client.close()
+                    except Exception as error:
+                        cleanup_error = error
+                    finally:
+                        _settings_timing('APP_SERVER_CLOSE', phase_started)
                         try:
-                            client.close()
-                        finally:
-                            _settings_timing('APP_SERVER_CLOSE', phase_started)
                             self.last_client_lifecycle = client.lifecycle_snapshot()
-                finally:
+                        except Exception as error:
+                            cleanup_error = cleanup_error or error
+                try:
                     self.store.clear_active_turn(thread_id, state.value if state is not LeaseState.CFR_ACTIVE else LeaseState.IDLE.value)
+                except Exception as error:
+                    cleanup_error = cleanup_error or error
+                    LOGGER.warning('CODEX_BINDING_CLEANUP_FAILED thread=%s type=%s', thread_id, type(error).__name__)
+                finally:
                     if state is LeaseState.CFR_ACTIVE:
                         self.leases.release(thread_id)
                     if durable_lease and self.runtime_leases:
-                        self.runtime_leases.release(durable_lease)
-                    _settings_timing('TOTAL', total_started)
+                        try:
+                            self._release_runtime_lease(durable_lease)
+                        except Exception as error:
+                            cleanup_error = cleanup_error or error
+                _settings_timing('TOTAL', total_started)
+                if cleanup_error is not None and not had_error:
+                    raise cleanup_error
 
         return await asyncio.to_thread(run)
 

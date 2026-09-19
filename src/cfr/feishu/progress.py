@@ -18,13 +18,14 @@ EMPTY_SLOT = '—'
 class FeishuTurnProgress:
     """Ephemeral, throttled presentation of one native Codex turn."""
 
-    def __init__(self, replies, message_id, open_id, workspace=None, *, clock=time.monotonic, interval=1.0):
+    def __init__(self, replies, message_id, open_id, workspace=None, *, clock=time.monotonic, interval=2.0, heartbeat=5.0):
         self.replies = replies
         self.message_id = message_id
         self.open_id = open_id
         self.workspace = workspace
         self.clock = clock
         self.interval = interval
+        self.heartbeat = heartbeat
         self.started_at = clock()
         self.card_id = None
         self.disabled = False
@@ -33,6 +34,9 @@ class FeishuTurnProgress:
         self._wake = threading.Event()
         self._lock = threading.RLock()
         self._state = {'state': 'accepted', 'steer_available': False, 'stage': 'starting'}
+        self._revision = 0
+        self._last_sent_revision = 0
+        self._last_sent_at = self.started_at
 
     def start(self):
         try:
@@ -49,9 +53,16 @@ class FeishuTurnProgress:
         if self.disabled or not isinstance(event, dict):
             return
         with self._lock:
-            for key in ('state', 'thread_id', 'turn_id', 'steer_available', 'stage', 'reasoning_summary', 'answer_preview', 'steer_received', 'last_native_activity_at'):
-                if key in event:
+            changed = False
+            for key in ('state', 'thread_id', 'turn_id', 'steer_available', 'stage', 'reasoning_summary', 'answer_preview', 'steer_received', 'last_native_activity_at', 'context_usage_percent'):
+                if key in event and self._state.get(key) != event[key]:
                     self._state[key] = event[key]
+                    changed = True
+            if changed:
+                self._revision += 1
+        # Intentionally do not wake for every native delta.  The periodic
+        # worker reads the latest projection, so event volume cannot translate
+        # into Feishu API volume or progress-thread CPU churn.
 
     def finish(self, turn):
         status = getattr(turn, 'status', turn)
@@ -70,10 +81,17 @@ class FeishuTurnProgress:
             self._wake.wait(self.interval)
             self._wake.clear()
             with self._lock:
-                card = self._card()
                 terminal = self._terminal
+                revision = self._revision
+                now = self.clock()
+                if not terminal and revision == self._last_sent_revision and now - self._last_sent_at < self.heartbeat:
+                    continue
+                card = self._card()
             if not self._update_card(card):
                 return
+            with self._lock:
+                self._last_sent_revision = max(self._last_sent_revision, revision)
+                self._last_sent_at = now
             if terminal:
                 return
 
@@ -111,10 +129,12 @@ class FeishuTurnProgress:
         reasoning_lines = self._fixed_preview_lines(state.get('reasoning_summary') or reasoning, MAX_REASONING_PREVIEW_CHARS, MAX_REASONING_PREVIEW_LINES, MAX_REASONING_PREVIEW_LINE_CHARS).splitlines()
         output_lines = self._fixed_preview_lines(state.get('answer_preview') or output, MAX_OUTPUT_PREVIEW_CHARS, MAX_OUTPUT_PREVIEW_LINES, MAX_OUTPUT_PREVIEW_LINE_CHARS).splitlines()
         workspace = str(self.workspace or EMPTY_SLOT).rstrip('/\\').replace('\\', '/').rsplit('/', 1)[-1]
+        context = state.get('context_usage_percent')
+        context_text = f'{context:.1f}%' if isinstance(context, (int, float)) else EMPTY_SLOT
         lines = [
             f'{names.get(state.get("state"), "运行中")} · {int(self.clock() - self.started_at)}s · {workspace}',
             f'阶段：{stages.get(stage, "Codex 正在处理")} · 活动：{activity}',
-            f'线程：{str(state["thread_id"])[-8:] if state.get("thread_id") else EMPTY_SLOT} · Turn：{str(state["turn_id"])[-8:] if state.get("turn_id") else EMPTY_SLOT}',
+            f'线程：{str(state["thread_id"])[-8:] if state.get("thread_id") else EMPTY_SLOT} · Turn：{str(state["turn_id"])[-8:] if state.get("turn_id") else EMPTY_SLOT} · Context：{context_text}',
             f'/steer：{"可" if active else "否"} · /redirect：{"可" if active else "否"}',
             f'思考：{reasoning_lines[0]}',
             f'　　　{reasoning_lines[1]}',
@@ -134,9 +154,10 @@ class FeishuTurnProgress:
         lines = []
         for part in text.splitlines():
             chunks = []
-            while part:
-                chunks.append(part[-line_chars:])
-                part = part[:-line_chars]
+            remaining = part
+            while remaining:
+                chunks.append(remaining[-line_chars:])
+                remaining = remaining[:-line_chars]
             lines.extend(reversed(chunks))
         if len(lines) > line_count:
             lines = lines[-line_count:]
@@ -144,3 +165,103 @@ class FeishuTurnProgress:
         if truncated and lines:
             lines[0] = '…' + lines[0][-(line_chars - 1):]
         return '\n'.join(lines + [EMPTY_SLOT] * (line_count - len(lines)))
+
+
+class FeishuChatProgress:
+    """Stream only ChatGPT text that is visibly rendered in the controlled web page."""
+
+    def __init__(self, replies, message_id, open_id, *, clock=time.monotonic, interval=2.0, heartbeat=5.0):
+        self.replies = replies
+        self.message_id = message_id
+        self.open_id = open_id
+        self.clock = clock
+        self.interval = interval
+        self.heartbeat = heartbeat
+        self.started_at = clock()
+        self.card_id = None
+        self.disabled = False
+        self._terminal = False
+        self._worker = None
+        self._wake = threading.Event()
+        self._lock = threading.RLock()
+        self._state = {'state': 'submitted', 'reasoning_text': '', 'answer_preview': ''}
+        self._revision = 0
+        self._last_sent_revision = 0
+        self._last_sent_at = self.started_at
+
+    def start(self):
+        try:
+            self.card_id = self.replies.send_card(self.message_id, self.open_id, self._card(), phase='chat-progress')
+        except Exception as error:
+            self.disabled = True
+            LOGGER.warning('FEISHU_CHAT_PROGRESS_CARD_SEND_FAILED type=%s', type(error).__name__)
+            return None
+        self._worker = threading.Thread(target=self._run, name='cfr-feishu-chat-progress', daemon=True)
+        self._worker.start()
+        return self.card_id
+
+    def on_progress(self, event):
+        if self.disabled or not isinstance(event, dict):
+            return
+        with self._lock:
+            changed = False
+            for key in ('state', 'reasoning_text', 'answer_preview'):
+                if key in event and self._state.get(key) != event[key]:
+                    self._state[key] = event[key]
+                    changed = True
+            if changed:
+                self._revision += 1
+
+    def finish(self, state='completed'):
+        self.on_progress({'state': state})
+        with self._lock:
+            self._terminal = True
+        self._wake.set()
+
+    def wait(self, timeout=1):
+        if self._worker:
+            self._worker.join(timeout)
+
+    def _run(self):
+        while True:
+            self._wake.wait(self.interval)
+            self._wake.clear()
+            with self._lock:
+                terminal = self._terminal
+                revision = self._revision
+                now = self.clock()
+                if not terminal and revision == self._last_sent_revision and now - self._last_sent_at < self.heartbeat:
+                    continue
+                card = self._card()
+            try:
+                self.replies.update_card(self.card_id, card)
+            except Exception as error:
+                self.disabled = True
+                LOGGER.warning('FEISHU_CHAT_PROGRESS_CARD_UPDATE_FAILED type=%s', type(error).__name__)
+                return
+            with self._lock:
+                self._last_sent_revision = max(self._last_sent_revision, revision)
+                self._last_sent_at = now
+            if terminal:
+                return
+
+    def _card(self):
+        with self._lock:
+            state = dict(self._state)
+        names = {'submitted': '已提交', 'generating': '生成中', 'delivering': '正在交付', 'completed': '已完成', 'failed': '失败', 'stopped': '已停止'}
+        reasoning = FeishuTurnProgress._fixed_preview_lines(
+            state.get('reasoning_text') or '等待网页显示可见思考内容…',
+            1000, 4, MAX_OUTPUT_PREVIEW_LINE_CHARS,
+        )
+        output = FeishuTurnProgress._fixed_preview_lines(
+            state.get('answer_preview') or '等待网页显示回复内容…',
+            1000, 4, MAX_OUTPUT_PREVIEW_LINE_CHARS,
+        )
+        content = '\n'.join([
+            f'{names.get(state.get("state"), "生成中")} · {int(self.clock() - self.started_at)}s',
+            '网页可见思考：',
+            reasoning,
+            '网页可见输出：',
+            output,
+        ])
+        return {'schema': '2.0', 'header': {'title': {'tag': 'plain_text', 'content': 'CFR · Chat · 执行过程'}}, 'body': {'elements': [{'tag': 'markdown', 'content': content}]}}

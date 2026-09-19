@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from concurrent.futures import ThreadPoolExecutor
 import json
+import re
 import threading
 import time
 import uuid
@@ -20,6 +22,9 @@ from .log_sanitize import sanitize_feishu_log_text
 from .models import FeishuExecutionContext
 from .replies import FeishuReplyClient
 from .store import FeishuStore
+
+
+APPROVAL_EVIDENCE_LIMIT = 200
 
 
 def first_present(mapping, *keys):
@@ -60,6 +65,19 @@ class _PendingApproval:
     request: ApprovalRequest | None = None
 
 
+@dataclass
+class _PendingUserInput:
+    request_id: str
+    chat_id: str
+    requester_open_id: str
+    thread_id: str
+    turn_id: str
+    questions: tuple[dict, ...]
+    event: threading.Event
+    answers: dict | None = None
+    cancelled: bool = False
+
+
 class ApprovalBridge:
     def __init__(self, store: FeishuStore, replies: FeishuReplyClient, settings: FeishuSettings):
         self.store = store
@@ -68,12 +86,18 @@ class ApprovalBridge:
         self.codec = CodexApprovalCodec()
         self._pending: dict[str, _PendingApproval] = {}
         self._lock = threading.RLock()
-        self._card_send_evidence: dict[str, dict] = {}
-        self._card_contract_evidence: dict[str, dict] = {}
-        self._feedback_evidence: dict[str, dict] = {}
-        self._requests: dict[str, ApprovalRequest] = {}
+        self._card_send_evidence: OrderedDict[str, dict] = OrderedDict()
+        self._card_contract_evidence: OrderedDict[str, dict] = OrderedDict()
+        self._feedback_evidence: OrderedDict[str, dict] = OrderedDict()
+        self._requests: OrderedDict[str, ApprovalRequest] = OrderedDict()
         self._feedback_futures = set()
         self._feedback_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='cfr-feishu-feedback')
+        self._pending_user_inputs: dict[str, _PendingUserInput] = {}
+
+    @staticmethod
+    def _trim(mapping):
+        while len(mapping) > APPROVAL_EVIDENCE_LIMIT:
+            mapping.popitem(last=False)
 
     def _card(self, request: ApprovalRequest, approval_id: str):
         return build_approval_feedback_card(request, approval_id, 'PENDING').payload
@@ -102,7 +126,11 @@ class ApprovalBridge:
         return {key: value for key, value in evidence.items() if value is not None}
 
     def _request_for_row(self, row):
-        request = self._requests.get(row.get('approval_id'))
+        approval_id = row.get('approval_id')
+        with self._lock:
+            request = self._requests.get(approval_id)
+            if request is not None:
+                self._requests.move_to_end(approval_id)
         if request is not None:
             return request
         try:
@@ -113,13 +141,26 @@ class ApprovalBridge:
             str(row.get('codex_request_id') or ''), str(row.get('thread_id') or ''), row.get('turn_id'), None,
             str(row.get('kind') or 'operation'), summary.get('reason'), summary.get('command'), summary.get('cwd'),
             tuple(summary.get('changed_paths') or ()), ('accept', 'decline'),
+            grant_root=summary.get('grant_root'),
+            method=summary.get('method'),
+            native_kind=summary.get('native_kind'),
+            command_actions=tuple(item for item in (summary.get('command_actions') or ()) if isinstance(item, dict)),
+            requested_permissions=summary.get('requested_permissions') if isinstance(summary.get('requested_permissions'), dict) else None,
+            network_approval_context=summary.get('network_approval_context') if isinstance(summary.get('network_approval_context'), dict) else None,
+            proposed_execpolicy_amendment=tuple(summary.get('proposed_execpolicy_amendment') or ()),
+            proposed_network_policy_amendments=tuple(item for item in (summary.get('proposed_network_policy_amendments') or ()) if isinstance(item, dict)),
         )
-        self._requests[row['approval_id']] = request
-        return request
+        with self._lock:
+            existing = self._requests.setdefault(row['approval_id'], request)
+            self._requests.move_to_end(row['approval_id'])
+            self._trim(self._requests)
+            return existing
 
     def _record_feedback_attempt(self, approval_id, state, attempted, succeeded=None, latency_ms=None, payload=None, stale=False, feedback=None):
         with self._lock:
             evidence = self._feedback_evidence.setdefault(approval_id, {})
+            self._feedback_evidence.move_to_end(approval_id)
+            self._trim(self._feedback_evidence)
             card_evidence = inspect_approval_feedback_card(payload or {})
             evidence.update({
                 'ApprovalFeedbackStateAttempted': state,
@@ -191,10 +232,10 @@ class ApprovalBridge:
                 futures = tuple(self._feedback_futures)
             if not futures:
                 return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
             for future in futures:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
                 try:
                     future.result(timeout=remaining)
                 except Exception:
@@ -253,6 +294,8 @@ class ApprovalBridge:
                 wait_timed_out = True
             with self._lock:
                 evidence = self._feedback_evidence.setdefault(row['approval_id'], {})
+                self._feedback_evidence.move_to_end(row['approval_id'])
+                self._trim(self._feedback_evidence)
                 evidence.update({
                     'ApprovalFeedbackFinalizationAuthority': (
                         'IDEMPOTENT_ALREADY_FINAL' if not triggered and already_final else trigger_source
@@ -278,10 +321,176 @@ class ApprovalBridge:
         }
 
     def close(self):
+        self.cancel_all_pending()
         self.wait_for_feedback(timeout=5.0)
         self._feedback_executor.shutdown(wait=True, cancel_futures=False)
 
+    @staticmethod
+    def _user_input_prompt(questions):
+        lines = ['Codex 需要你的输入。请直接回复这条会话中的下一条文本；CFR 会把它作为当前任务的回答，不会创建新任务。']
+        if len(questions) > 1:
+            lines.append('多问题请按“1: 回答”“2: 回答”的格式逐行回复。')
+        for index, question in enumerate(questions, 1):
+            header = str(question.get('header') or f'问题 {index}').strip()
+            text = str(question.get('question') or '').strip()
+            lines.append(f'\n{index}. {header}\n{text}')
+            options = question.get('options') or ()
+            for option_index, option in enumerate(options, 1):
+                if not isinstance(option, dict):
+                    continue
+                label = str(option.get('label') or '').strip()
+                description = str(option.get('description') or '').strip()
+                letter = chr(ord('A') + option_index - 1) if option_index <= 26 else str(option_index)
+                lines.append(f'   {letter}. {label}' + (f' — {description}' if description else ''))
+            if question.get('isOther'):
+                lines.append('   也可以直接输入其他答案。')
+        return '\n'.join(lines).strip()
+
+    @staticmethod
+    def _normalize_question_answer(question, raw):
+        value = str(raw or '').strip()
+        options = [item for item in (question.get('options') or ()) if isinstance(item, dict)]
+        if not options or not value:
+            return value
+        upper = value.upper()
+        if len(upper) == 1 and 'A' <= upper <= 'Z':
+            index = ord(upper) - ord('A')
+            if index < len(options):
+                return str(options[index].get('label') or value)
+        if value.isdigit():
+            index = int(value) - 1
+            if 0 <= index < len(options):
+                return str(options[index].get('label') or value)
+        for option in options:
+            label = str(option.get('label') or '').strip()
+            if label and value.casefold() == label.casefold():
+                return label
+        return value
+
+    @classmethod
+    def _parse_user_input_answers(cls, questions, text):
+        questions = tuple(questions or ())
+        raw = str(text or '').strip()
+        if not questions or not raw:
+            return None
+        indexed = {}
+        if len(questions) > 1:
+            for line in raw.splitlines():
+                match = re.match(r'^\s*(\d+)\s*[:：.)、-]\s*(.+?)\s*$', line)
+                if match:
+                    indexed[int(match.group(1))] = match.group(2)
+            if len(indexed) < len(questions):
+                return None
+        answers = {}
+        for index, question in enumerate(questions, 1):
+            value = raw if len(questions) == 1 else indexed.get(index)
+            if value is None:
+                return None
+            answer = cls._normalize_question_answer(question, value)
+            question_id = str(question.get('id') or index)
+            answers[question_id] = {'answers': [answer]}
+        return answers
+
+    def handle_user_input_request(self, message, context: FeishuExecutionContext):
+        params = message.get('params') or {}
+        request_id = message.get('id')
+        questions = tuple(item for item in (params.get('questions') or ()) if isinstance(item, dict))
+        thread_id = str(params.get('threadId') or context.thread_id or '')
+        turn_id = str(params.get('turnId') or '')
+        if request_id is None or not thread_id or not turn_id or not questions:
+            return {'error': {'code': -32602, 'message': 'CODEX_USER_INPUT_REQUEST_INVALID'}}
+        if any(bool(question.get('isSecret')) for question in questions):
+            try:
+                self.replies.reply_text(
+                    context.message_id,
+                    'Codex 请求了 secret 输入。CFR 不会通过飞书收集密码、令牌或其他秘密值，因此已拒绝该输入请求。',
+                    f'user-input-secret:{request_id}',
+                    chat_id=context.chat_id,
+                )
+            except Exception:
+                pass
+            return {'error': {'code': -32010, 'message': 'CFR_SECRET_USER_INPUT_UNSUPPORTED'}}
+        pending = _PendingUserInput(
+            request_id=str(request_id),
+            chat_id=context.chat_id,
+            requester_open_id=context.sender_open_id,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            questions=questions,
+            event=threading.Event(),
+        )
+        with self._lock:
+            if context.chat_id in self._pending_user_inputs:
+                return {'error': {'code': -32011, 'message': 'CFR_USER_INPUT_ALREADY_PENDING'}}
+            self._pending_user_inputs[context.chat_id] = pending
+        try:
+            self.replies.reply_text(
+                context.message_id,
+                self._user_input_prompt(questions),
+                f'user-input:{request_id}',
+                chat_id=context.chat_id,
+            )
+        except Exception:
+            with self._lock:
+                self._pending_user_inputs.pop(context.chat_id, None)
+            return {'error': {'code': -32012, 'message': 'CFR_USER_INPUT_PROMPT_DELIVERY_FAILED'}}
+        timeout = min(float(self.settings.approval_timeout_seconds), 24 * 60 * 60)
+        pending.event.wait(timeout)
+        with self._lock:
+            self._pending_user_inputs.pop(context.chat_id, None)
+        if pending.cancelled:
+            return {'error': {'code': -32013, 'message': 'CFR_USER_INPUT_CANCELLED'}}
+        if pending.answers is None:
+            return {'error': {'code': -32014, 'message': 'CFR_USER_INPUT_TIMEOUT'}}
+        return {'answers': pending.answers}
+
+    def consume_user_input_message(self, message) -> bool:
+        text = str(getattr(message, 'text', '') or '').strip()
+        if getattr(message, 'message_type', None) != 'text' or not text:
+            return False
+        # CFR control commands must remain available while Codex is waiting for
+        # input, especially /stop. Do not swallow them as model answers.
+        if text.startswith('/'):
+            return False
+        chat_id = str(getattr(message, 'chat_id', '') or '')
+        sender = str(getattr(message, 'sender_open_id', '') or '')
+        with self._lock:
+            pending = self._pending_user_inputs.get(chat_id)
+        if pending is None or sender != pending.requester_open_id:
+            return False
+        if not self.store.enqueue_message(message):
+            return True
+        answers = self._parse_user_input_answers(pending.questions, message.text)
+        if answers is None:
+            self.store.mark_ignored(message.message_id, 'CODEX_USER_INPUT_INVALID', 'Reply did not match the pending Codex user-input question')
+            try:
+                self.replies.reply_text(
+                    message.message_id,
+                    '这条回复无法匹配当前 Codex 输入问题。请按提示的编号格式重新回复。',
+                    f'user-input-invalid:{pending.request_id}',
+                    chat_id=chat_id,
+                )
+            except Exception:
+                pass
+            return True
+        pending.answers = answers
+        self.store.mark_completed(message.message_id, None)
+        pending.event.set()
+        return True
+
     def handle_server_request(self, message, context: FeishuExecutionContext):
+        method = message.get('method') if isinstance(message, dict) else None
+        if method == 'item/tool/requestUserInput':
+            return self.handle_user_input_request(message, context)
+        if method == 'currentTime/read':
+            return {'currentTimeAt': int(time.time())}
+        if method in {
+            'item/tool/call',
+            'mcpServer/elicitation/request',
+            'account/chatgptAuthTokens/refresh',
+            'attestation/generate',
+        }:
+            return {'error': {'code': -32601, 'message': f'{method} is not advertised by CFR'}}
         params = message.get('params') or {}
         thread_id = first_present(params, 'threadId', 'thread_id')
         if thread_id is None:
@@ -289,18 +498,37 @@ class ApprovalBridge:
         request = self.codec.decode(message, str(thread_id or ''))
         if request is None:
             raise StructuredError('UNSUPPORTED_CODEX_SERVER_REQUEST', 'Unknown Codex server request rejected')
+        if not request.cwd and context.cwd:
+            request = replace(request, cwd=context.cwd)
         approval_id = uuid.uuid4().hex
         expires = time.time() + self.settings.approval_timeout_seconds
-        summary = json.dumps({'reason': request.reason, 'cwd': request.cwd, 'command': (request.command or '')[:1000], 'changed_paths': request.changed_paths})
+        summary = json.dumps({
+            'reason': request.reason,
+            'cwd': request.cwd,
+            'command': (request.command or '')[:1000],
+            'changed_paths': request.changed_paths,
+            'grant_root': request.grant_root,
+            'method': request.method,
+            'native_kind': request.native_kind,
+            'command_actions': request.command_actions,
+            'requested_permissions': request.requested_permissions,
+            'network_approval_context': request.network_approval_context,
+            'proposed_execpolicy_amendment': request.proposed_execpolicy_amendment,
+            'proposed_network_policy_amendments': request.proposed_network_policy_amendments,
+        })
         self.store.create_approval(approval_id, request, context.sender_open_id, expires, summary)
         with self._lock:
             pending = _PendingApproval(approval_id, threading.Event(), request.request_id, request.thread_id, request=request)
             self._pending[approval_id] = pending
             self._requests[approval_id] = request
+            self._requests.move_to_end(approval_id)
+            self._trim(self._requests)
         try:
             card = self._card(request, approval_id)
             with self._lock:
                 self._card_contract_evidence[approval_id] = inspect_approval_card_v2(card)
+                self._card_contract_evidence.move_to_end(approval_id)
+                self._trim(self._card_contract_evidence)
             response_id = self.replies.send_card(context.message_id, context.sender_open_id, card, phase=f'approval:{approval_id}')
             if not response_id:
                 raise StructuredError('FEISHU_APPROVAL_CARD_SEND_FAILED', 'Feishu approval card was not delivered')
@@ -317,11 +545,15 @@ class ApprovalBridge:
                     'FeishuErrorMessageSanitized': None,
                     'FeishuMessageId': str(response_id),
                 }
+                self._card_send_evidence.move_to_end(approval_id)
+                self._trim(self._card_send_evidence)
                 self._feedback_evidence[approval_id] = {
                     'ApprovalFeedbackStateInitial': 'PENDING',
                     'ApprovalFeedbackMessageIdBound': True,
                     'ApprovalFeedbackOriginalCardUpdated': False,
                 }
+                self._feedback_evidence.move_to_end(approval_id)
+                self._trim(self._feedback_evidence)
         except Exception as exc:
             data = exc.data if isinstance(exc, StructuredError) and isinstance(exc.data, dict) else {}
             with self._lock:
@@ -334,10 +566,12 @@ class ApprovalBridge:
                     'FailureDisposition': 'decline',
                     'FailureDispositionReason': 'FEISHU_CARD_DELIVERY_FAILED',
                 }
+                self._card_send_evidence.move_to_end(approval_id)
+                self._trim(self._card_send_evidence)
             with self._lock:
                 self._pending.pop(approval_id, None)
             self.store.resolve_approval(approval_id, 'decline', 'cancelled')
-            return self.codec.response('decline')
+            return self.codec.response('decline', request)
         pending.event.wait(self.settings.approval_timeout_seconds)
         # The card callback itself remains fast: it only schedules the update.
         # Before the approval request is released to Codex, make the local
@@ -348,15 +582,19 @@ class ApprovalBridge:
             self._pending.pop(approval_id, None)
         if pending.decision is None:
             self.store.expire_approval(approval_id)
-            return self.codec.response('decline')
-        return self.codec.response(pending.decision)
+            return self.codec.response('decline', request)
+        return self.codec.response(pending.decision, request)
 
     def cancel_all_pending(self):
         with self._lock:
             pending = list(self._pending.values())
+            pending_user_inputs = list(self._pending_user_inputs.values())
         for item in pending:
             self.store.resolve_approval(item.approval_id, 'cancel', 'cancelled')
             item.decision = 'cancel'
+            item.event.set()
+        for item in pending_user_inputs:
+            item.cancelled = True
             item.event.set()
 
     def handle_server_notification(self, message):
@@ -374,12 +612,24 @@ class ApprovalBridge:
                 item for item in self._pending.values()
                 if (request_id and item.request_id == request_id) or (thread_id and item.thread_id == thread_id)
             ]
+            input_matches = [
+                item for item in self._pending_user_inputs.values()
+                if (request_id and item.request_id == request_id)
+                or (
+                    method in {'turn/completed', 'turn/interrupted'}
+                    and thread_id and item.thread_id == thread_id
+                    and (not params.get('turnId') or item.turn_id == str(params.get('turnId')))
+                )
+            ]
         for item in matches:
             # A real card decision may win this race before the notification
             # arrives. Never overwrite a terminal operator decision.
             if self.store.resolve_approval(item.approval_id, 'cancel', 'resolved'):
                 item.decision = 'cancel'
                 item.event.set()
+        for item in input_matches:
+            item.cancelled = True
+            item.event.set()
         if method in {'turn/completed', 'turn/interrupted'}:
             identity = extract_turn_terminal_identity(message)
             if identity is not None:
@@ -389,7 +639,7 @@ class ApprovalBridge:
                     turn_status=identity['turn_status'],
                     trigger_source='TURN_NOTIFICATION_FALLBACK',
                 )
-        return len(matches)
+        return len(matches) + len(input_matches)
 
     def resolve(self, approval_id, operator_open_id, action):
         row = self.store.get_approval(approval_id)

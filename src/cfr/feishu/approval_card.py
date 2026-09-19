@@ -34,16 +34,71 @@ def _bounded(value: Any, limit: int, fallback: str = '<not provided>') -> str:
     return (text[:limit] if text else fallback)
 
 
-def _workspace_name(cwd: Any) -> str:
-    text = _bounded(cwd, 160, '<unknown workspace>')
-    return text.replace('\\', '/').rstrip('/').split('/')[-1] or '<unknown workspace>'
+def _workspace_display(cwd: Any) -> str:
+    return _bounded(cwd, 260, '<unknown workspace>')
+
+
+def _command_actions_summary(request: Any) -> str | None:
+    actions = tuple(getattr(request, 'command_actions', ()) or ())
+    if not actions:
+        return None
+    parts = []
+    for action in actions[:4]:
+        if not isinstance(action, dict):
+            continue
+        kind = _bounded(action.get('type'), 40, 'action')
+        path = action.get('path')
+        query = action.get('query')
+        name = action.get('name')
+        detail = path or query or name or action.get('command') or action.get('cmd')
+        parts.append(f'{kind}: {_bounded(detail, 140)}')
+    if len(actions) > 4:
+        parts.append(f'+{len(actions) - 4} more')
+    return '; '.join(parts) if parts else None
+
+
+def _permissions_summary(request: Any) -> str | None:
+    permissions = getattr(request, 'requested_permissions', None)
+    if not isinstance(permissions, dict) or not permissions:
+        return None
+    parts = []
+    filesystem = permissions.get('fileSystem') or permissions.get('file_system')
+    if isinstance(filesystem, dict):
+        entries = filesystem.get('entries') or ()
+        for entry in entries[:6] if isinstance(entries, list) else ():
+            if not isinstance(entry, dict):
+                continue
+            access = _bounded(entry.get('access'), 20, 'access')
+            path = entry.get('path')
+            if isinstance(path, dict):
+                target = path.get('path') or path.get('pattern')
+                if not target and isinstance(path.get('value'), dict):
+                    target = path['value'].get('kind') or path['value'].get('path')
+            else:
+                target = path
+            parts.append(f'filesystem {access}: {_bounded(target, 160)}')
+        for legacy_key in ('read', 'write'):
+            values = filesystem.get(legacy_key) or ()
+            if isinstance(values, list):
+                parts.extend(f'filesystem {legacy_key}: {_bounded(value, 160)}' for value in values[:4])
+    network = permissions.get('network')
+    if isinstance(network, dict) and network.get('enabled') is not None:
+        parts.append(f'network: {"enabled" if network.get("enabled") else "disabled"}')
+    return '; '.join(parts) if parts else None
 
 
 def _operation_summary(request: Any) -> str:
+    actions = _command_actions_summary(request)
+    if actions:
+        return actions
     changed_paths = tuple(getattr(request, 'changed_paths', ()) or ())
     if changed_paths:
-        return f'{getattr(request, "kind", "operation")} affecting {len(changed_paths)} path(s)'
-    command = _bounded(getattr(request, 'command', None), 240)
+        preview = ', '.join(_bounded(path, 120) for path in changed_paths[:3])
+        suffix = f' (+{len(changed_paths) - 3} more)' if len(changed_paths) > 3 else ''
+        return f'{getattr(request, "kind", "operation")}: {preview}{suffix}'
+    if getattr(request, 'kind', None) == 'file_change':
+        return 'file_change: Codex requests permission to write files'
+    command = _bounded(getattr(request, 'command', None), 500)
     return f'{getattr(request, "kind", "operation")}: {command}'
 
 
@@ -85,11 +140,26 @@ def build_approval_feedback_card(
         status = f'{status}\n\n{_bounded(feedback, 240)}'
     summary_content = (
         f'**Type:** {_bounded(getattr(request, "kind", None), 80)}\n'
-        f'**Workspace:** `{_workspace_name(getattr(request, "cwd", None))}`\n'
+        f'**Workspace:** `{_workspace_display(getattr(request, "cwd", None))}`\n'
         f'**Thread:** `{_bounded(getattr(request, "thread_id", None), 80)}`\n'
         f'**Operation:** {_operation_summary(request)}\n'
-        f'**Risk:** {_bounded(getattr(request, "reason", None), 240)}'
+        f'**Risk:** {_bounded(getattr(request, "reason", None), 240, "Codex current file-change approval request does not include per-path details." if getattr(request, "kind", None) == "file_change" else "<not provided>")}'
     )
+    grant_root = getattr(request, 'grant_root', None)
+    if grant_root:
+        summary_content += f'\n**Grant root:** `{_bounded(grant_root, 260)}`'
+    permissions = _permissions_summary(request)
+    if permissions:
+        summary_content += f'\n**Requested permissions:** {_bounded(permissions, 1000)}'
+    network_context = getattr(request, 'network_approval_context', None)
+    if isinstance(network_context, dict) and network_context:
+        summary_content += f'\n**Network context:** {_bounded(network_context, 500)}'
+    execpolicy = tuple(getattr(request, 'proposed_execpolicy_amendment', ()) or ())
+    if execpolicy:
+        summary_content += f'\n**Proposed exec policy:** {_bounded("; ".join(execpolicy), 500)}'
+    network_policy = tuple(getattr(request, 'proposed_network_policy_amendments', ()) or ())
+    if network_policy:
+        summary_content += f'\n**Proposed network policy:** {_bounded(network_policy, 500)}'
     elements = [{'tag': 'markdown', 'content': summary_content + (f'\n{status}' if state == 'PENDING' else '')}]
     if state != 'PENDING':
         elements.append({'tag': 'markdown', 'content': status})

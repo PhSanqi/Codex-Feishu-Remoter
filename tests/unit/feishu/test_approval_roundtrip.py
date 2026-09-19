@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'src'))
 from cfr.codex.app_server import AppServerClient
 from cfr.feishu.approvals import ApprovalBridge
 from cfr.feishu.config import FeishuSettings
-from cfr.feishu.models import FeishuExecutionContext
+from cfr.feishu.models import FeishuExecutionContext, FeishuInboundMessage
 from cfr.feishu.replies import FeishuReplyClient
 from cfr.feishu.store import FeishuStore
 from cfr.feishu.transport import FakeFeishuTransport
@@ -22,6 +22,43 @@ class FakeLauncher:
 
 
 class ApprovalRoundtripTests(unittest.TestCase):
+    def test_request_user_input_consumes_next_feishu_reply_without_creating_new_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'db.sqlite3'
+            store = FeishuStore(path)
+            transport = FakeFeishuTransport()
+            settings = FeishuSettings('app-input', 'secret', ('ou-operator',), (Path(directory),), database=path, approval_timeout_seconds=5)
+            bridge = ApprovalBridge(store, FeishuReplyClient(transport, store), settings)
+            result = []
+            import threading
+            worker = threading.Thread(target=lambda: result.append(bridge.handle_server_request({
+                'id': 'input-1',
+                'method': 'item/tool/requestUserInput',
+                'params': {
+                    'threadId': 'thread-x', 'turnId': 'turn-x', 'itemId': 'item-x',
+                    'questions': [{
+                        'id': 'choice', 'header': '保存方式', 'question': '请选择保存方式',
+                        'options': [{'label': '覆盖原文件'}, {'label': '生成新文件'}],
+                        'isOther': False, 'isSecret': False,
+                    }],
+                },
+            }, FeishuExecutionContext('message-1', 'chat-1', 'ou-operator', 'thread-x'))))
+            worker.start()
+            for _ in range(100):
+                if transport.messages:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(transport.messages)
+            reply = FeishuInboundMessage(
+                'event-input', 'message-input', 'chat-1', 'p2p', 'ou-operator', 'user', 'text', 'B',
+            )
+            self.assertTrue(bridge.consume_user_input_message(reply))
+            worker.join(2)
+            self.assertEqual(result, [{'answers': {'choice': {'answers': ['生成新文件']}}}])
+            with store._connection() as connection:
+                row = connection.execute('select status from feishu_inbox where message_id=?', ('message-input',)).fetchone()
+            self.assertEqual(row['status'], 'completed')
+
     def test_protocol_server_request_roundtrip_returns_schema_valid_decision(self):
         with tempfile.TemporaryDirectory() as directory:
             store = FeishuStore(Path(directory) / 'db.sqlite3')

@@ -27,6 +27,7 @@ class CodexLauncher:
             self.config_overrides = list(config_overrides)
         self.executable = Path(executable).expanduser() if executable else None
         self.environment = dict(os.environ if environment is None else environment)
+        self._resolved: ResolvedCodexExecutable | None = None
 
     @staticmethod
     def _kind(path: Path) -> str:
@@ -37,20 +38,43 @@ class CodexLauncher:
             return 'bat'
         return 'native'
 
+    @staticmethod
+    def _project_local_candidates() -> tuple[Path, ...]:
+        """Return Codex launchers installed by CFR's Linux bootstrap.
+
+        Normal resolution still prefers an explicit path, CFR_CODEX_BIN and
+        the ambient PATH.  This fallback exists so source-checkout CLI
+        commands keep working when CFR was bootstrapped with the project-local
+        npm prefix but the caller did not source scripts/cfr_env.sh first.
+        """
+        root = Path(__file__).resolve().parents[3]
+        bin_dir = root / '.local-tools' / 'node_modules' / '.bin'
+        names = ('codex.cmd', 'codex.exe', 'codex') if os.name == 'nt' else ('codex',)
+        return tuple(bin_dir / name for name in names)
+
     def resolve(self) -> ResolvedCodexExecutable:
+        if self._resolved is not None:
+            return self._resolved
         if self.executable:
-            return ResolvedCodexExecutable(self.executable, 'explicit', self._kind(self.executable))
+            self._resolved = ResolvedCodexExecutable(self.executable, 'explicit', self._kind(self.executable))
+            return self._resolved
         configured = self.environment.get('CFR_CODEX_BIN')
         if configured:
             path = Path(configured).expanduser()
-            return ResolvedCodexExecutable(path, 'CFR_CODEX_BIN', self._kind(path))
+            self._resolved = ResolvedCodexExecutable(path, 'CFR_CODEX_BIN', self._kind(path))
+            return self._resolved
         names = ('codex.cmd', 'codex.exe', 'codex') if os.name == 'nt' else ('codex',)
         for name in names:
             found = shutil.which(name, path=self.environment.get('PATH'))
             if found:
                 path = Path(found)
-                return ResolvedCodexExecutable(path, 'path', self._kind(path))
-        raise FileNotFoundError('codex executable not found via explicit path, CFR_CODEX_BIN, or PATH')
+                self._resolved = ResolvedCodexExecutable(path, 'path', self._kind(path))
+                return self._resolved
+        for path in self._project_local_candidates():
+            if path.is_file():
+                self._resolved = ResolvedCodexExecutable(path, 'project-local', self._kind(path))
+                return self._resolved
+        raise FileNotFoundError('codex executable not found via explicit path, CFR_CODEX_BIN, PATH, or CFR project-local tools')
 
     def discover(self) -> Path:
         return self.resolve().path

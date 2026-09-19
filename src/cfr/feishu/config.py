@@ -11,6 +11,10 @@ from cfr.core.models import StructuredError
 from .credentials import FeishuCredentialResolver, LocalConfigStore
 
 
+MAX_WORKER_CONCURRENCY = 32
+MAX_APPROVAL_TIMEOUT_SECONDS = 24 * 60 * 60
+
+
 def _split(value: str | None) -> tuple[str, ...]:
     if not value:
         return ()
@@ -35,6 +39,7 @@ class FeishuSettings:
     app_secret_updated_at: str | None = None
     operator_policy_source: str = 'missing'
     workspace_policy_source: str = 'missing'
+    default_surface: str = 'code'
 
     @property
     def app_namespace(self) -> str:
@@ -66,8 +71,10 @@ class FeishuSettings:
             raise StructuredError('FEISHU_WORKSPACE_ALLOWLIST_REQUIRED', 'Set at least one allowed workspace root')
         if any(not root.exists() or not root.is_dir() for root in self.allowed_workspace_roots):
             raise StructuredError('FEISHU_WORKSPACE_ROOT_INVALID', 'All configured workspace roots must be existing directories')
-        if self.approval_timeout_seconds <= 0 or self.worker_concurrency <= 0:
-            raise StructuredError('FEISHU_CONFIG_INVALID', 'Timeout and worker concurrency must be positive')
+        if not 0 < self.approval_timeout_seconds <= MAX_APPROVAL_TIMEOUT_SECONDS:
+            raise StructuredError('FEISHU_CONFIG_INVALID', 'Approval timeout must be positive and no more than 24 hours')
+        if not 1 <= self.worker_concurrency <= MAX_WORKER_CONCURRENCY:
+            raise StructuredError('FEISHU_CONFIG_INVALID', f'Worker concurrency must be between 1 and {MAX_WORKER_CONCURRENCY}')
 
     def validate_connection(self):
         if not self.credentials_present:
@@ -99,6 +106,10 @@ def load_settings(
         concurrency = int(env.get('CFR_FEISHU_WORKER_CONCURRENCY', '4'))
     except ValueError as exc:
         raise StructuredError('FEISHU_CONFIG_INVALID', 'Timeout and worker concurrency must be integers') from exc
+    if not 1 <= approval_timeout <= MAX_APPROVAL_TIMEOUT_SECONDS:
+        raise StructuredError('FEISHU_CONFIG_INVALID', 'Approval timeout must be between 1 second and 24 hours')
+    if not 1 <= concurrency <= MAX_WORKER_CONCURRENCY:
+        raise StructuredError('FEISHU_CONFIG_INVALID', f'Worker concurrency must be between 1 and {MAX_WORKER_CONCURRENCY}')
     sdk_log_level = env.get('CFR_FEISHU_SDK_LOG_LEVEL', 'WARNING').strip().upper()
     if sdk_log_level not in {'WARNING', 'ERROR', 'INFO'}:
         raise StructuredError('FEISHU_CONFIG_INVALID', 'CFR_FEISHU_SDK_LOG_LEVEL must be WARNING, ERROR, or INFO')
@@ -119,4 +130,5 @@ def load_settings(
         app_secret_updated_at=credentials.app_secret_updated_at,
         operator_policy_source='environment' if env_open_ids else ('persistent' if persistent_open_ids else 'missing'),
         workspace_policy_source='environment' if env_roots else ('persistent' if persistent_roots else 'missing'),
+        default_surface=config.get_default_surface(),
     )

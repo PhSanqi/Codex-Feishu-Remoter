@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import time
 from typing import Any
 
 from cfr.codex.app_server import AppServerClient, AppServerRpcError
+from cfr.control.model_registry import CATALOG_SCHEMA_VERSION, project_runtime_model
 
 
 _PAGE_LIMIT = 100
@@ -22,18 +24,22 @@ def _items(value: Any) -> list[Any]:
     return list(value) if isinstance(value, (list, tuple)) else []
 
 
-def _page_through(client, method: str, params: dict[str, Any]) -> list[Mapping[str, Any]]:
+def _page_through(client, method: str, params: dict[str, Any], *, deadline: float | None = None) -> list[Mapping[str, Any]]:
     records: list[Mapping[str, Any]] = []
     cursor = None
     seen_cursors = set()
+    deadline = time.monotonic() + _TIMEOUT_SECONDS if deadline is None else deadline
     for _ in range(_MAX_PAGES):
-        response = client.request(method, {**params, 'cursor': cursor}, timeout=_TIMEOUT_SECONDS)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        response = client.request(method, {**params, 'cursor': cursor}, timeout=remaining)
         if not isinstance(response, Mapping):
             break
         for item in _items(response.get('data')):
             if isinstance(item, Mapping):
                 records.append(item)
-                if len(records) == _MAX_RECORDS:
+                if len(records) >= _MAX_RECORDS:
                     return records
         cursor = response.get('nextCursor')
         if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
@@ -50,32 +56,9 @@ def _unavailable(error_code: str, message: str) -> dict[str, Any]:
     return {'available': False, 'error_code': error_code, 'message': message, 'data': []}
 
 
-def _project_model(item: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        'id': _text(item.get('id')),
-        'model': _text(item.get('model')),
-        'display_name': _text(item.get('displayName')),
-        'description': _text(item.get('description')),
-        'is_default': item.get('isDefault') is True,
-        'default_reasoning_effort': _text(item.get('defaultReasoningEffort')),
-        'supported_reasoning_efforts': [
-            {'reasoning_effort': _text(effort.get('reasoningEffort')), 'description': _text(effort.get('description'))}
-            for effort in _items(item.get('supportedReasoningEfforts')) if isinstance(effort, Mapping)
-        ],
-        'service_tiers': [
-            {'id': _text(tier.get('id')), 'name': _text(tier.get('name')), 'description': _text(tier.get('description'))}
-            for tier in _items(item.get('serviceTiers')) if isinstance(tier, Mapping)
-        ],
-        'default_service_tier': _text(item.get('defaultServiceTier')),
-        'input_modalities': [value for value in _items(item.get('inputModalities')) if isinstance(value, str)],
-        'supports_personality': item.get('supportsPersonality') is True,
-        'model_specialty': _text(item.get('modelSpecialty')),
-    }
-
-
 def model_catalog(client) -> list[dict[str, Any]]:
     """Project the installed runtime catalog for another Control read operation."""
-    return [_project_model(item) for item in _page_through(client, 'model/list', {'includeHidden': False, 'limit': _PAGE_LIMIT})]
+    return [project_runtime_model(item) for item in _page_through(client, 'model/list', {'includeHidden': False, 'limit': _PAGE_LIMIT})]
 
 
 def models(client_factory=AppServerClient) -> dict[str, Any]:
@@ -88,7 +71,14 @@ def models(client_factory=AppServerClient) -> dict[str, Any]:
         return _unavailable(code, 'Installed Codex model catalog is unavailable.')
     except Exception:
         return _unavailable('CODEX_MODEL_LIST_FAILED', 'Installed Codex model catalog is unavailable.')
-    return {'available': True, 'error_code': None, 'message': 'Installed Codex model catalog', 'data': data}
+    return {
+        'available': True,
+        'error_code': None,
+        'message': 'Installed Codex model catalog',
+        'source': 'codex_runtime',
+        'catalog_schema_version': CATALOG_SCHEMA_VERSION,
+        'data': data,
+    }
 
 
 def collaboration_modes(client_factory=AppServerClient) -> dict[str, Any]:
@@ -108,9 +98,25 @@ def collaboration_modes(client_factory=AppServerClient) -> dict[str, Any]:
     return {'available': True, 'error_code': None, 'message': 'Installed Codex collaboration modes', 'data': data}
 
 
-def _capability_section(client, method: str, unavailable_code: str, failed_code: str, projector) -> dict[str, Any]:
+def _capability_section(
+    client,
+    method: str,
+    unavailable_code: str,
+    failed_code: str,
+    projector,
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any]:
     try:
-        return {'available': True, 'error_code': None, 'message': 'Installed Codex capability', 'data': [projector(item) for item in _page_through(client, method, {'limit': _PAGE_LIMIT})]}
+        return {
+            'available': True,
+            'error_code': None,
+            'message': 'Installed Codex capability',
+            'data': [
+                projector(item)
+                for item in _page_through(client, method, {'limit': _PAGE_LIMIT}, deadline=deadline)
+            ],
+        }
     except AppServerRpcError as error:
         code = unavailable_code if _method_missing(error) else failed_code
         return _unavailable(code, 'Installed Codex capability is unavailable.')
@@ -122,9 +128,11 @@ def capabilities(client_factory=AppServerClient) -> dict[str, Any]:
     """Read global/default capability state without loading a CFR thread."""
     try:
         with client_factory(timeout=_TIMEOUT_SECONDS) as client:
+            deadline = time.monotonic() + _TIMEOUT_SECONDS
             profiles = _capability_section(
                 client, 'permissionProfile/list', 'CODEX_PERMISSION_PROFILE_LIST_UNAVAILABLE', 'CODEX_PERMISSION_PROFILE_LIST_FAILED',
                 lambda item: {'id': _text(item.get('id')), 'allowed': item.get('allowed') is True, 'description': _text(item.get('description'))},
+                deadline=deadline,
             )
             features = _capability_section(
                 client, 'experimentalFeature/list', 'CODEX_FEATURE_LIST_UNAVAILABLE', 'CODEX_FEATURE_LIST_FAILED',
@@ -132,6 +140,7 @@ def capabilities(client_factory=AppServerClient) -> dict[str, Any]:
                     'name': _text(item.get('name')), 'stage': _text(item.get('stage')), 'enabled': item.get('enabled') is True,
                     'default_enabled': item.get('defaultEnabled') is True, 'display_name': _text(item.get('displayName')), 'description': _text(item.get('description')),
                 },
+                deadline=deadline,
             )
     except Exception:
         profiles = _unavailable('CODEX_PERMISSION_PROFILE_LIST_FAILED', 'Installed Codex capability is unavailable.')

@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from scripts.run_feishu_sdk_probe import build_result
+from scripts.run_m2_feishu_sdk_probe import build_result
 
 
 class SdkProbeTests(unittest.TestCase):

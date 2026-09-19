@@ -46,7 +46,22 @@ def validate_workspace(path: str | Path, settings: FeishuSettings) -> Path:
                 return candidate
         except ValueError:
             continue
-    raise StructuredError('FEISHU_WORKSPACE_NOT_ALLOWED', f'Workspace is outside the configured allowlist: {candidate.name}')
+    raise StructuredError(
+        'FEISHU_WORKSPACE_NOT_ALLOWED',
+        f'工作区不在 CFR 允许列表中：{candidate}。请在控制中心 → 配置 → 允许的工作区中添加该目录。',
+    )
+
+
+def validate_file(path: str | Path, settings: FeishuSettings) -> Path:
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute() or not candidate.exists() or not candidate.is_file():
+        raise StructuredError('FEISHU_FILE_NOT_ALLOWED', 'File must be an existing absolute path')
+    resolved = candidate.resolve(strict=True)
+    try:
+        validate_workspace(resolved.parent, settings)
+    except StructuredError as error:
+        raise StructuredError('FEISHU_FILE_NOT_ALLOWED', f'File is outside the configured workspace allowlist: {resolved.name}') from error
+    return resolved
 
 
 def safe_identifier(value: str | None, keep=4) -> str:

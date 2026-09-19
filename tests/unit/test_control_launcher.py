@@ -105,12 +105,17 @@ class ControlLauncherTests(unittest.TestCase):
 
     def test_fresh_browser_uses_bootstrap_url(self):
         server = _Server()
-        with patch.object(self.launcher, 'CfrSupervisor'), patch.object(self.launcher, 'LocalControlServer', return_value=server), patch.object(self.launcher.webbrowser, 'open', return_value=True) as browser, patch.object(self.launcher.time, 'sleep', side_effect=KeyboardInterrupt):
+        with patch.object(self.launcher, 'CfrSupervisor') as supervisor_type, patch.object(self.launcher, 'LocalControlServer', return_value=server), patch.object(self.launcher.webbrowser, 'open', return_value=True) as browser, patch.object(self.launcher.time, 'sleep', side_effect=KeyboardInterrupt):
+            supervisor_type.return_value.start_browser_bridge.return_value = {'status': 'ready'}
+            supervisor_type.return_value.start_feishu.return_value.status = 'ok'
+            supervisor_type.return_value.start_feishu.return_value.error_code = None
             result, payload = self._run(['--port', '0', '--open-browser'])
         self.assertEqual(result, 0)
         self.assertEqual(payload['url'], server.bootstrap_url)
+        self.assertEqual(payload['feishu'], 'running')
         self.assertTrue(payload['browser_opened'])
         browser.assert_called_once_with(server.bootstrap_url)
+        supervisor_type.return_value.start_feishu.assert_called_once_with()
         self.assertTrue(server.stopped)
 
     def test_browser_failure_keeps_fresh_server_running(self):
@@ -134,5 +139,6 @@ class ControlLauncherTests(unittest.TestCase):
         content = (ROOT / 'START_CFR.cmd').read_text(encoding='utf-8').lower()
         self.assertIn('cd /d "%~dp0"', content)
         self.assertIn('run_cfr_control.py --open-browser', content)
+        self.assertIn('dedicated chatgpt browser, and feishu runtime', content)
         for forbidden in ('pip install', 'npm install', 'schtasks', 'taskkill'):
             self.assertNotIn(forbidden, content)

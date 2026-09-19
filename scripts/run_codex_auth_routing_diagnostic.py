@@ -3,9 +3,6 @@ import json
 import platform
 import re
 import shutil
-import socket
-import ssl
-import time
 import urllib.error
 import urllib.request
 import uuid
@@ -29,7 +26,7 @@ from cfr.codex.launcher import CodexLauncher
 from cfr.codex.threads import ThreadManager
 from cfr.codex.turns import TurnManager
 from cfr.config import child_process_env, resolve_cfr_codex_home
-from cfr.network import proxy_child_env, proxy_endpoint, resolve_proxy, sanitized_proxy_url
+from cfr.network import proxy_child_env, resolve_proxy, sanitized_proxy_url
 
 
 def now():

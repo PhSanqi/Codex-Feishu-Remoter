@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'src'))
 
 from cfr.codex.approvals import ApprovalRequest
 from cfr.feishu.approval_card import build_approval_feedback_card, inspect_approval_feedback_card
-from cfr.feishu.approvals import ApprovalBridge
+from cfr.feishu.approvals import APPROVAL_EVIDENCE_LIMIT, ApprovalBridge
 from cfr.feishu.config import FeishuSettings
 from cfr.feishu.models import FeishuExecutionContext
 from cfr.feishu.replies import FeishuReplyClient
@@ -67,6 +67,33 @@ class ApprovalFeedbackUxTests(unittest.TestCase):
             self.assertFalse(evidence['ApprovalFeedbackLegacyActionTagPresent'])
             self.assertEqual(evidence['ApprovalFeedbackActiveButtons'], count)
             self.assertTrue(evidence['ApprovalFeedbackNoSecretFields'])
+
+    def test_in_memory_approval_evidence_is_bounded(self):
+        with self.bridge._lock:
+            for index in range(APPROVAL_EVIDENCE_LIMIT + 25):
+                approval_id = f'approval-{index}'
+                self.bridge._card_send_evidence[approval_id] = {'index': index}
+                self.bridge._trim(self.bridge._card_send_evidence)
+        self.assertEqual(len(self.bridge._card_send_evidence), APPROVAL_EVIDENCE_LIMIT)
+        self.assertNotIn('approval-0', self.bridge._card_send_evidence)
+        self.assertIn(f'approval-{APPROVAL_EVIDENCE_LIMIT + 24}', self.bridge._card_send_evidence)
+
+    def test_feedback_wait_uses_one_shared_deadline_for_all_futures(self):
+        class SlowFuture:
+            def result(self, timeout):
+                time.sleep(timeout)
+                raise TimeoutError
+
+        futures = {SlowFuture(), SlowFuture(), SlowFuture()}
+        with self.bridge._lock:
+            self.bridge._feedback_futures = futures
+        started = time.monotonic()
+        try:
+            self.assertFalse(self.bridge.wait_for_feedback(timeout=0.05))
+            self.assertLess(time.monotonic() - started, 0.12)
+        finally:
+            with self.bridge._lock:
+                self.bridge._feedback_futures = set()
 
     def test_allow_feedback_updates_original_card_and_finalizes(self):
         row, worker, values = self._start()

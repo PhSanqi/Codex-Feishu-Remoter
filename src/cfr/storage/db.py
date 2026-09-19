@@ -1,35 +1,87 @@
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from typing import ClassVar
 
 from cfr.core.models import BindingRecord, ThreadRef
 
 
+INITIALIZED_FILE_CACHE_LIMIT = 128
+MAX_EVENT_DEDUPE_ROWS = 100_000
+EVENT_DEDUPE_MAX_AGE_SECONDS = 90 * 24 * 60 * 60
+
+
 class BindingStore:
+    _initialization_lock: ClassVar[threading.Lock] = threading.Lock()
+    _initialized_files: ClassVar[dict[str, tuple[int, int]]] = {}
+
     def __init__(self, path):
         self.db_path = Path(path)
         self._memory = str(path) == ':memory:'
-        self._memory_conn = sqlite3.connect(':memory:') if self._memory else None
+        self._memory_conn = sqlite3.connect(':memory:', check_same_thread=False) if self._memory else None
+        self._memory_lock = threading.RLock()
         if str(self.db_path) != ':memory:' and self.db_path.parent != Path('.'):
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        self._ensure_initialized()
+
+    def _file_identity(self):
+        try:
+            stat = self.db_path.resolve().stat()
+        except OSError:
+            return None
+        return stat.st_dev, stat.st_ino
+
+    def _ensure_initialized(self):
+        if self._memory:
+            self._initialize()
+            return
+        key = str(self.db_path.resolve())
+        with self._initialization_lock:
+            identity = self._file_identity()
+            if identity is not None and self._initialized_files.get(key) == identity:
+                return
+            self._initialize()
+            identity = self._file_identity()
+            if identity is not None:
+                if key not in self._initialized_files and len(self._initialized_files) >= INITIALIZED_FILE_CACHE_LIMIT:
+                    self._initialized_files.pop(next(iter(self._initialized_files)))
+                self._initialized_files[key] = identity
 
     def _connect(self):
-        return self._memory_conn if self._memory else sqlite3.connect(self.db_path)
+        if self._memory:
+            if self._memory_conn is None:
+                raise RuntimeError('In-memory BindingStore connection is unavailable')
+            connection = self._memory_conn
+        else:
+            connection = sqlite3.connect(self.db_path, timeout=5.0)
+        connection.execute('pragma busy_timeout=5000')
+        if not self._memory:
+            connection.execute('pragma synchronous=normal')
+        return connection
 
     @contextmanager
     def _connection(self):
         conn = self._connect()
+        if self._memory:
+            self._memory_lock.acquire()
         try:
             yield conn
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
+            if self._memory:
+                self._memory_lock.release()
             if not self._memory:
                 conn.close()
 
     def _initialize(self):
         with self._connection() as conn:
+            if not self._memory:
+                conn.execute('pragma journal_mode=wal').fetchone()
             conn.executescript('''
                 create table if not exists projects(id integer primary key, name text);
                 create table if not exists codex_bindings(
@@ -46,6 +98,8 @@ class BindingStore:
                     writer_state text default 'idle'
                 );
                 create table if not exists event_dedupe(event_key text primary key, created_at real);
+                create index if not exists idx_codex_bindings_updated on codex_bindings(updated_at);
+                create index if not exists idx_event_dedupe_created on event_dedupe(created_at);
             ''')
             columns = {row[1] for row in conn.execute('pragma table_info(codex_bindings)')}
             if 'last_rollout_byte_offset' not in columns:
@@ -137,18 +191,40 @@ class BindingStore:
 
     get = get_binding
 
-    def list_bindings(self):
+    def list_bindings(self, limit=None):
+        query = '''
+            select thread_id,thread_name,cwd,rollout_path,last_rollout_byte_offset,
+                   last_seen_turn_id,desktop_sync_state,active_turn_id,writer_state,
+                   observed_model,observed_reasoning_effort,observed_service_tier,observed_settings_at,
+                   created_at,updated_at
+            from codex_bindings order by updated_at desc
+        '''
         with self._connection() as conn:
-            rows = conn.execute('''
-                select thread_id,thread_name,cwd,rollout_path,last_rollout_byte_offset,
-                       last_seen_turn_id,desktop_sync_state,active_turn_id,writer_state,
-                       observed_model,observed_reasoning_effort,observed_service_tier,observed_settings_at,
-                       created_at,updated_at
-                from codex_bindings order by updated_at desc
-            ''').fetchall()
+            if limit is None:
+                rows = conn.execute(query).fetchall()
+            else:
+                rows = conn.execute(query + ' limit ?', (max(0, int(limit)),)).fetchall()
         return [self._record(row) for row in rows]
 
     list = list_bindings
+
+    def list_rollout_paths(self):
+        """Return only persisted native rollout paths for bounded storage telemetry."""
+        with self._connection() as conn:
+            rows = conn.execute(
+                "select rollout_path from codex_bindings where rollout_path is not null and rollout_path != ''"
+            ).fetchall()
+        return [Path(row[0]) for row in rows]
+
+    def has_busy_bindings(self):
+        """Return whether any CFR-known thread can be disrupted by a Desktop restart."""
+        with self._connection() as conn:
+            row = conn.execute('''
+                select 1 from codex_bindings
+                where active_turn_id is not null or coalesce(writer_state, 'idle') != 'idle'
+                limit 1
+            ''').fetchone()
+        return row is not None
 
     def update_rollout_offset(self, thread_id, value):
         with self._connection() as conn:
@@ -212,6 +288,39 @@ class BindingStore:
             return True
 
     seen = seen_event
+
+    def prune_event_dedupe(
+        self,
+        *,
+        max_rows=MAX_EVENT_DEDUPE_ROWS,
+        max_age_seconds=EVENT_DEDUPE_MAX_AGE_SECONDS,
+        now=None,
+    ):
+        """Bound CLI rollout-event history without touching native rollouts.
+
+        The persisted rollout byte offset remains the primary replay boundary.
+        This table is only a secondary duplicate guard for visible CLI events,
+        so retaining the newest 100k rows or 90 days is sufficient while
+        preventing unbounded CFR-owned SQLite growth.
+        """
+        max_rows = max(1, int(max_rows))
+        max_age_seconds = max(0.0, float(max_age_seconds))
+        cutoff = (time.time() if now is None else float(now)) - max_age_seconds
+        with self._connection() as conn:
+            before = conn.execute('select count(*) from event_dedupe').fetchone()[0]
+            conn.execute('delete from event_dedupe where created_at < ?', (cutoff,))
+            remaining = conn.execute('select count(*) from event_dedupe').fetchone()[0]
+            excess = max(0, remaining - max_rows)
+            if excess:
+                conn.execute(
+                    '''delete from event_dedupe where event_key in (
+                           select event_key from event_dedupe
+                           order by created_at,event_key limit ?
+                       )''',
+                    (excess,),
+                )
+            after = conn.execute('select count(*) from event_dedupe').fetchone()[0]
+        return {'before': before, 'after': after, 'deleted': before - after}
 
     def close(self):
         if self._memory_conn:

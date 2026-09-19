@@ -49,6 +49,16 @@ class _RetryClient(_Client):
         ])
 
 
+class _StartFailureClient(_Client):
+    def subscribe(self, _predicate):
+        return _Subscription([])
+
+    def request(self, method, _params):
+        if method == 'turn/start':
+            raise RuntimeError('start failed')
+        raise AssertionError(method)
+
+
 class RuntimeTelemetryTests(unittest.TestCase):
     def test_metrics_tokens_and_terminal_stage_are_projected(self):
         telemetry = TurnTelemetry('message-secret', thread_id='thread-1', turn_id='turn-1')
@@ -184,6 +194,22 @@ class RuntimeTelemetryTests(unittest.TestCase):
         snapshots = registry.telemetry_snapshots()
         self.assertEqual(len(snapshots), RECENT_TURN_LIMIT)
         self.assertEqual(len(registry._pending), RECENT_TURN_LIMIT)
+
+    def test_turn_start_failure_is_terminal_and_not_left_pending(self):
+        registry = ActiveTurnRegistry()
+        with self.assertRaises(RuntimeError):
+            TurnManager(_StartFailureClient(), registry).run_turn('thread-1', 'prompt')
+        snapshot = registry.telemetry_snapshots()[0]
+        self.assertEqual(snapshot['status'], 'failed')
+        self.assertEqual(snapshot['stage'], 'failed')
+        self.assertEqual(len(registry._pending), 0)
+
+    def test_invalid_turn_timeout_is_rejected_before_subscription(self):
+        client = _Client()
+        for value in (0, -1, float('inf'), 'invalid'):
+            with self.subTest(value=value), self.assertRaises(Exception) as caught:
+                TurnManager(client, ActiveTurnRegistry()).run_turn('thread-1', 'prompt', timeout=value)
+            self.assertIn('CODEX_TURN_TIMEOUT_INVALID', str(caught.exception))
 
 
 if __name__ == '__main__':

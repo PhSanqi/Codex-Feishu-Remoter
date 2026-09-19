@@ -1,6 +1,5 @@
 from dataclasses import dataclass
 import os
-from pathlib import Path
 from typing import Mapping
 import urllib.parse
 import urllib.request
@@ -97,14 +96,58 @@ def resolve_proxy(explicit=None, environment=None, system_proxies=None):
     return ProxyResolution('direct', None, None, no_proxy, 'direct')
 
 
+def validate_proxy_url(value):
+    proxy = str(value or '').strip()
+    if not proxy:
+        raise ValueError('proxy URL is required')
+    parsed = urllib.parse.urlsplit(proxy if '://' in proxy else f'http://{proxy}')
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+        raise ValueError('only http/https proxy URLs are supported')
+    if parsed.username or parsed.password:
+        raise ValueError('proxy credentials are not stored in CFR config')
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def resolve_cfr_proxy(environment=None, system_proxies=None, config_store=None):
+    """Resolve CFR's effective proxy with persistent user policy.
+
+    ``direct`` and ``proxy`` are explicit user choices and therefore outrank
+    inherited HTTP(S)_PROXY variables.  ``auto`` is the only mode that consults
+    environment and system proxy discovery.
+    """
+    env = dict(os.environ if environment is None else environment)
+    if config_store is None:
+        from cfr.feishu.credentials import LocalConfigStore
+        config_store = LocalConfigStore()
+    policy = config_store.get_network_policy()
+    mode = policy.get('mode', 'auto')
+    if mode == 'direct':
+        return ProxyResolution('direct', None, None, _env_value(env, 'NO_PROXY', 'no_proxy'), 'persistent')
+    if mode == 'proxy':
+        proxy = validate_proxy_url(policy.get('proxy_url'))
+        return ProxyResolution('proxy', proxy, proxy, _env_value(env, 'NO_PROXY', 'no_proxy'), 'persistent')
+    return resolve_proxy(environment=env, system_proxies=system_proxies)
+
+
 def proxy_child_env(resolution: ProxyResolution):
+    proxy_keys = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')
     if resolution.mode != 'proxy' or not resolution.selected_proxy:
-        return None
+        # AppServerClient overlays this mapping onto os.environ. Empty values
+        # are therefore required to make an explicit Direct policy real rather
+        # than silently inheriting the parent process proxy.
+        environment = {key: '' for key in proxy_keys}
+        environment.update({
+            'NO_PROXY': resolution.no_proxy or 'localhost,127.0.0.1,::1',
+            'no_proxy': resolution.no_proxy or 'localhost,127.0.0.1,::1',
+        })
+        return environment
     environment = {
         'HTTP_PROXY': resolution.http_proxy or resolution.selected_proxy,
         'HTTPS_PROXY': resolution.https_proxy or resolution.selected_proxy,
         'http_proxy': resolution.http_proxy or resolution.selected_proxy,
         'https_proxy': resolution.https_proxy or resolution.selected_proxy,
+        'ALL_PROXY': '',
+        'all_proxy': '',
         'NO_PROXY': resolution.no_proxy or 'localhost,127.0.0.1,::1',
         'no_proxy': resolution.no_proxy or 'localhost,127.0.0.1,::1',
     }

@@ -30,6 +30,45 @@ def _factory(client):
 
 
 class CodexCatalogTests(unittest.TestCase):
+    def test_future_model_is_discovered_without_cfr_slug_changes_and_preserves_extensions(self):
+        client = _Client({'model/list': {'data': [{
+            'id': 'gpt-6-astra',
+            'model': 'gpt-6-astra',
+            'displayName': 'GPT-6 Astra',
+            'description': 'future runtime model',
+            'isDefault': False,
+            'defaultReasoningEffort': 'high',
+            'supportedReasoningEfforts': [
+                {'reasoningEffort': value, 'description': value}
+                for value in ('low', 'medium', 'high', 'xhigh', 'max')
+            ],
+            'serviceTiers': [],
+            'inputModalities': ['text', 'image'],
+            'multiAgentVersion': 'v2',
+            'futureCapability': {'mode': 'async-tools'},
+        }], 'nextCursor': None}})
+        result = models(_factory(client))
+        model = result['data'][0]
+        self.assertEqual(result['source'], 'codex_runtime')
+        self.assertEqual(result['catalog_schema_version'], 1)
+        self.assertEqual(model['model'], 'gpt-6-astra')
+        self.assertEqual(model['multi_agent_version'], 'v2')
+        self.assertEqual(model['supported_reasoning_efforts'][-1]['reasoning_effort'], 'max')
+        self.assertEqual(model['extensions']['futureCapability'], {'mode': 'async-tools'})
+
+    def test_upgrade_and_availability_metadata_are_normalized(self):
+        client = _Client({'model/list': {'data': [{
+            'id': 'old', 'model': 'old', 'displayName': 'Old', 'description': '',
+            'isDefault': False, 'defaultReasoningEffort': 'low', 'supportedReasoningEfforts': [],
+            'upgrade': 'new',
+            'upgradeInfo': {'model': 'new', 'migrationMarkdown': 'move', 'retirementAt': 123},
+            'availabilityNux': {'message': 'limited rollout'},
+        }], 'nextCursor': None}})
+        model = models(_factory(client))['data'][0]
+        self.assertEqual(model['upgrade_model'], 'new')
+        self.assertEqual(model['upgrade_info']['retirement_at'], 123)
+        self.assertEqual(model['availability_message'], 'limited rollout')
+
     def test_models_use_runtime_catalog_without_hardcoded_entries(self):
         client = _Client({'model/list': {'data': [
             {'id': 'runtime-a', 'model': 'runtime-slug-a', 'displayName': 'Runtime A', 'description': 'A', 'isDefault': True, 'defaultReasoningEffort': 'custom-a', 'supportedReasoningEfforts': []},

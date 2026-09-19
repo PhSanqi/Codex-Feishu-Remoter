@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import sqlite3
 
@@ -11,14 +10,16 @@ from .config import load_settings
 from .connection import FeishuConnectionLease
 from .transport import ChannelFeishuTransport
 from .transport import _require_channel_sdk, channel_sdk_metadata
-from .sdk_compat import inspect_channel_sdk_loop
+from .sdk_compat import close_idle_channel_sdk_loop, inspect_channel_sdk_loop
 
 
 def _sdk_status():
     try:
         _require_channel_sdk()
         metadata = channel_sdk_metadata()
-        return True, metadata['version'], inspect_channel_sdk_loop()
+        diagnostic = inspect_channel_sdk_loop()
+        close_idle_channel_sdk_loop()
+        return True, metadata['version'], diagnostic
     except Exception:
         return False, None, None
 

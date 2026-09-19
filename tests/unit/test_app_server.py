@@ -3,12 +3,13 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+import queue
+from unittest.mock import ANY, MagicMock, patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
 
-from cfr.codex.app_server import AppServerClient, AppServerRpcError, ServerRequestResolution
+from cfr.codex.app_server import AppServerClient, AppServerRpcError, DIAGNOSTIC_QUEUE_LIMIT, ServerRequestResolution
 
 
 class FakeLauncher:
@@ -17,6 +18,24 @@ class FakeLauncher:
 
 
 class AppServerTests(unittest.TestCase):
+    def test_fail_pending_never_blocks_when_a_response_already_filled_the_waiter(self):
+        client = AppServerClient(FakeLauncher(), timeout=2.0, process_env={})
+        waiter = queue.Queue(1)
+        response = {'result': {'ok': True}}
+        waiter.put(response)
+        client._pending[1] = waiter
+        client._fail_pending(RuntimeError('closed'))
+        self.assertEqual(waiter.get_nowait(), response)
+
+    def test_diagnostic_mirror_drops_oldest_instead_of_growing_without_bound(self):
+        client = AppServerClient(FakeLauncher(), timeout=2.0, process_env={})
+        for index in range(DIAGNOSTIC_QUEUE_LIMIT + 10):
+            client._put_diagnostic(client.notifications, {'index': index})
+        self.assertEqual(client.notifications.qsize(), DIAGNOSTIC_QUEUE_LIMIT)
+        values = [client.notifications.get_nowait()['index'] for _ in range(DIAGNOSTIC_QUEUE_LIMIT)]
+        self.assertEqual(values[0], 10)
+        self.assertEqual(values[-1], DIAGNOSTIC_QUEUE_LIMIT + 9)
+
     def test_server_request_handler_result_is_written(self):
         with AppServerClient(FakeLauncher(), timeout=2.0, on_server_request=lambda message: {'decision': 'accept_once'}) as client:
             subscription = client.subscribe(lambda message: message.get('method') == 'server_response_observed')
@@ -50,6 +69,48 @@ class AppServerTests(unittest.TestCase):
             subscription.close()
         self.assertTrue(names)
         self.assertNotEqual(names[0], 'cfr-app-server-stdout')
+
+    def test_file_change_patch_projection_enriches_current_approval_request_by_item_id(self):
+        client = AppServerClient(FakeLauncher(), timeout=2.0, process_env={})
+        client._record_file_change_projection({
+            'method': 'item/fileChange/patchUpdated',
+            'params': {
+                'threadId': 'thread-1', 'turnId': 'turn-1', 'itemId': 'item-1',
+                'changes': [
+                    {'path': 'C:/workspace/test/report.xlsx', 'kind': 'add', 'diff': '...'},
+                    {'path': 'C:/workspace/test/preview.png', 'kind': 'add', 'diff': '...'},
+                ],
+            },
+        })
+        request = client._enrich_server_request({
+            'id': 99,
+            'method': 'item/fileChange/requestApproval',
+            'params': {'threadId': 'thread-1', 'turnId': 'turn-1', 'itemId': 'item-1'},
+        }, wait_seconds=0)
+        self.assertEqual(request['params']['_cfrChangedPaths'], [
+            'C:/workspace/test/report.xlsx', 'C:/workspace/test/preview.png',
+        ])
+
+    def test_file_change_approval_wait_can_observe_patch_notification_from_reader(self):
+        client = AppServerClient(FakeLauncher(), timeout=2.0, process_env={})
+        result = []
+        request = {
+            'id': 99,
+            'method': 'item/fileChange/requestApproval',
+            'params': {'threadId': 'thread-1', 'turnId': 'turn-1', 'itemId': 'item-1'},
+        }
+        thread = threading.Thread(target=lambda: result.append(client._enrich_server_request(request, wait_seconds=0.2)))
+        thread.start()
+        time.sleep(0.03)
+        client._record_file_change_projection({
+            'method': 'item/fileChange/patchUpdated',
+            'params': {
+                'threadId': 'thread-1', 'turnId': 'turn-1', 'itemId': 'item-1',
+                'changes': [{'path': 'C:/workspace/test/result.xlsx', 'kind': 'add', 'diff': '...'}],
+            },
+        })
+        thread.join(1)
+        self.assertEqual(result[0]['params']['_cfrChangedPaths'], ['C:/workspace/test/result.xlsx'])
 
     def test_server_request_exactly_once(self):
         with AppServerClient(FakeLauncher(), timeout=2.0, on_server_request=lambda message: {'ok': True}) as client:
@@ -137,7 +198,7 @@ class AppServerTests(unittest.TestCase):
                 self.assertEqual(environment['CODEX_HOME'], directory)
 
     def test_default_process_env_projects_detected_system_proxy(self):
-        with patch('cfr.codex.app_server.resolve_proxy', return_value=object()), patch(
+        with patch('cfr.codex.app_server.resolve_cfr_proxy', return_value=object()), patch(
             'cfr.codex.app_server.proxy_child_env',
             return_value={
                 'HTTP_PROXY': 'http://127.0.0.1:57777',
@@ -149,7 +210,7 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(client.process_env['HTTPS_PROXY'], 'http://127.0.0.1:57777')
 
     def test_explicit_process_env_does_not_autodiscover_proxy(self):
-        with patch('cfr.codex.app_server.resolve_proxy', side_effect=AssertionError('should not resolve proxy')):
+        with patch('cfr.codex.app_server.resolve_cfr_proxy', side_effect=AssertionError('should not resolve proxy')):
             client = AppServerClient(FakeLauncher(), timeout=2.0, process_env={'CFR_EXPLICIT_ENV': '1'})
         self.assertEqual(client.process_env['CFR_EXPLICIT_ENV'], '1')
 
@@ -178,9 +239,25 @@ class AppServerTests(unittest.TestCase):
         taskkill.assert_called_once_with(
             ['taskkill', '/PID', '123', '/T', '/F'],
             stdout=__import__('subprocess').DEVNULL, stderr=__import__('subprocess').DEVNULL, timeout=5, check=False,
+            creationflags=getattr(__import__('subprocess'), 'CREATE_NO_WINDOW', 0), startupinfo=ANY,
         )
         client.proc.send_signal.assert_called_once()
         self.assertEqual(client.close_mode, 'kill_tree')
+
+    def test_windows_close_does_not_flush_stdin_before_process_exit(self):
+        client = AppServerClient(FakeLauncher(), timeout=2.0)
+        client.proc = MagicMock(pid=123)
+        client.proc.poll.return_value = None
+        client.proc.stdin.closed = False
+        client.proc.stdout = None
+        client.proc.stderr = None
+        client.proc.wait.return_value = 0
+        events = []
+        client.proc.send_signal.side_effect = lambda *_args: events.append('signal')
+        client.proc.stdin.close.side_effect = lambda: events.append('stdin_close')
+        with patch('cfr.codex.app_server.os.name', 'nt'):
+            client.close()
+        self.assertEqual(events[:2], ['signal', 'stdin_close'])
 
 
 if __name__ == '__main__':

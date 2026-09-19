@@ -19,12 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 
 from cfr.codex.app_server import AppServerClient, AppServerRpcError
-from cfr.codex.diagnostics import gate_metadata, inspect_runtime, normalize_gate_origin, routing_decision, safe_error
+from cfr.codex.diagnostics import gate_metadata, inspect_runtime, normalize_gate_origin, routing_decision
 from cfr.codex.launcher import CodexLauncher
 from cfr.codex.threads import ThreadManager
 from cfr.codex.turns import TurnManager
 from cfr.config import child_process_env, resolve_cfr_codex_home
-from cfr.network import proxy_child_env, proxy_endpoint, resolve_proxy, sanitized_proxy_url
+from cfr.network import proxy_child_env, proxy_endpoint, resolve_cfr_proxy, sanitized_proxy_url
 
 HOST = 'api.openai.com'
 PORT = 443
@@ -216,7 +216,7 @@ def main():
     log_path = artifact_dir / 'preflight.log'
     events_path = artifact_dir / 'app_server_events.jsonl'
     events_path.touch()
-    resolution = resolve_proxy()
+    resolution = resolve_cfr_proxy()
     resolved_home = resolve_cfr_codex_home(args.codex_home)
     direct = direct_path_probe()
     proxy = proxy_listener_probe(resolution) if resolution.mode == 'proxy' else {'ProxyListenerReachable': False, 'ProxyConnectTunnel': 'NOT_RUN', 'ProxyHttpsReachable': False, 'ProxyHttpStatus': None}

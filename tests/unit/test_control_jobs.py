@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from cfr.codex.diagnostics import codex_interface_capabilities, missing_required_app_server_methods
 from cfr.codex.turns import ActiveTurnRegistry
@@ -76,6 +77,62 @@ class JobsReadModelTests(unittest.TestCase):
         self.assertEqual(job['status'], 'failed')
         self.assertFalse(job['active'])
         self.assertFalse(job['can_interrupt'])
+
+    def test_jobs_reads_pending_approvals_once_instead_of_per_turn(self):
+        telemetry = self.registry.begin('message', thread_id='thread-active', received_at=10, queued_at=10, execution_started_at=10)
+        telemetry.set_identity(turn_id='turn-active')
+        telemetry.set_stage('running', status='running')
+        self.registry.register(ActiveTurn('thread-active', 'turn-active', _ForbiddenClient(), telemetry=telemetry))
+        store = SimpleNamespace(
+            list_pending_approval_turns=lambda: {('thread-active', 'turn-active')},
+            list_approvals_for_turn=lambda *_args: (_ for _ in ()).throw(AssertionError('N+1 approval query')),
+        )
+        self.model.__dict__['_feishu_store'] = store
+        job = self.model.jobs()[0]
+        self.assertEqual(job['status'], 'waiting_approval')
+
+    def test_jobs_fetches_only_bindings_referenced_by_current_runtime_snapshot(self):
+        self.registry.register(ActiveTurn('thread-active', 'turn-active', _ForbiddenClient()))
+        with patch.object(
+            self.model._binding_store,
+            'list_bindings',
+            side_effect=AssertionError('jobs must not scan historical bindings'),
+        ):
+            job = self.model.jobs()[0]
+        self.assertEqual(job['thread_id'], 'thread-active')
+        self.assertEqual(job['workspace'], 'thread-active')
+
+    def test_storage_projection_reads_only_rollout_paths_not_binding_objects(self):
+        with patch.object(
+            self.model._binding_store,
+            'list_bindings',
+            side_effect=AssertionError('storage must not materialize every historical binding'),
+        ):
+            storage = self.model.storage()
+        self.assertEqual(storage['codex_rollout_count'], 0)
+
+    def test_chat_runtime_is_projected_alongside_code_jobs(self):
+        self.model.supervisor._daemon.chat_runtime_snapshot = lambda: [{
+            'id': 'private-chat-message-id',
+            'chat_id': 'chat-1',
+            'status': 'running',
+            'active': True,
+            'stage': 'generating',
+            'started_at': 10.0,
+            'completed_at': None,
+            'url': 'https://chatgpt.com/c/conv-1',
+            'conversation_id': 'conv-1',
+            'attachment_count': 4,
+            'output_count': 0,
+            'error_code': None,
+        }]
+        job = self.model.jobs()[0]
+        self.assertEqual(job['surface'], 'chat')
+        self.assertEqual(job['status'], 'running')
+        self.assertTrue(job['active'])
+        self.assertEqual(job['stage'], 'generating')
+        self.assertEqual(job['conversation_id'], 'conv-1')
+        self.assertEqual(job['attachment_count'], 4)
 
     def test_missing_optional_turns_capability_does_not_block_snapshot(self):
         schema = Path(self.directory.name) / 'schema.json'

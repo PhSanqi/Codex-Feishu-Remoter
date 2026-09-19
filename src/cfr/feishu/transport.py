@@ -2,22 +2,57 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import importlib.metadata
 import inspect
 import json
 import logging
+import os
+from pathlib import Path
 import threading
 import time
 from typing import Any, Callable, Protocol
+import urllib.request
 
 from cfr.core.models import StructuredError
 
 from .config import FeishuSettings
 from .approval_card import parse_v2_card_callback
 from .log_sanitize import configure_feishu_sdk_logging, sanitize_feishu_log_text
-from .sdk_compat import ChannelSdkLoopDiagnostic, ChannelSdkShutdownCapture, SdkShutdownDiagnostic, capture_channel_sdk_shutdown_targets, classify_channel_error, drain_sdk_tasks, preclose_device_flow_before_public_shutdown, prepare_channel_sdk_runtime, shutdown_channel_without_device_flow_close
+from .sdk_compat import ChannelSdkShutdownCapture, SdkShutdownDiagnostic, capture_channel_sdk_shutdown_targets, classify_channel_error, drain_sdk_tasks, preclose_device_flow_before_public_shutdown, prepare_channel_sdk_runtime, shutdown_channel_without_device_flow_close
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_channel_proxy_url(value: str | None) -> str | None:
+    """Normalize desktop SOCKS proxy URLs for the Channel SDK.
+
+    GNOME may expose a manual SOCKS proxy as ``socks://host:port``.  Both
+    requests/PySocks and websockets/python-socks require the SOCKS version to
+    be explicit.  Treat GNOME's version-less SOCKS URL as SOCKS5 with remote
+    DNS, without changing the operating-system proxy configuration.
+    """
+    proxy = str(value or '').strip()
+    if not proxy:
+        return None
+    if proxy.lower().startswith('socks://'):
+        return f'socks5h://{proxy[len("socks://"):]}'
+    return proxy
+
+
+def _channel_proxy_url(environment=None, system_proxies=None) -> str | None:
+    """Resolve a proxy for Feishu without mutating global network settings."""
+    env = dict(os.environ if environment is None else environment)
+    for key in ('HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy'):
+        proxy = _normalize_channel_proxy_url(env.get(key))
+        if proxy:
+            return proxy
+    proxies = dict(urllib.request.getproxies() if system_proxies is None else system_proxies)
+    for key in ('https', 'http', 'all', 'socks'):
+        proxy = _normalize_channel_proxy_url(proxies.get(key))
+        if proxy:
+            return proxy
+    return None
 
 
 def _require_lark():
@@ -92,9 +127,16 @@ def _require_send_success(result) -> str:
 
 class FeishuTransport(Protocol):
     def reply_text(self, message_id: str, chat_id: str, text: str, uuid: str) -> str: ...
+    def reply_image(self, message_id: str, chat_id: str, image: bytes, uuid: str) -> str: ...
+    def reply_file(self, message_id: str, chat_id: str, path: Path, uuid: str) -> str: ...
+    def reply_video(self, message_id: str, chat_id: str, path: Path, uuid: str) -> str: ...
     def send_text(self, open_id: str, text: str, uuid: str) -> str: ...
     def send_card(self, open_id: str, card: dict[str, Any], uuid: str) -> str: ...
     def update_card(self, message_id: str, card: dict[str, Any]) -> str: ...
+    def upload_image(self, image: bytes) -> str: ...
+    def download_image(self, image_key: str, message_id: str | None = None) -> bytes: ...
+    def download_image_to_file(self, image_key: str, dest_dir: Path, message_id: str | None = None) -> Path: ...
+    def download_file_to_file(self, file_key: str, dest_dir: Path, message_id: str | None = None, file_name: str | None = None, resource_type: str = 'file') -> Path: ...
 
 
 @dataclass(frozen=True)
@@ -132,6 +174,15 @@ class FakeFeishuTransport:
 
     def send_text(self, open_id, text, uuid):
         return self._send('send_text', open_id, text, uuid)
+
+    def reply_image(self, message_id, chat_id, image, uuid):
+        return self._send('reply_image', chat_id, bytes(image), uuid)
+
+    def reply_file(self, message_id, chat_id, path, uuid):
+        return self._send('reply_file', chat_id, str(Path(path)), uuid)
+
+    def reply_video(self, message_id, chat_id, path, uuid):
+        return self._send('reply_video', chat_id, str(Path(path)), uuid)
 
     def send_card(self, open_id, card, uuid):
         return self._send('send_card', open_id, card, uuid)
@@ -185,7 +236,7 @@ class LarkFeishuTransport:
     def reply_text(self, message_id, chat_id, text=None, uuid=None):
         if uuid is None:
             uuid, text = text, chat_id
-        lark = _require_lark()
+        _require_lark()
         from lark_oapi.api.im.v1 import ReplyMessageRequest, ReplyMessageRequestBody
         request = ReplyMessageRequest.builder().message_id(message_id).request_body(ReplyMessageRequestBody.builder().content(json.dumps({'text': text}, ensure_ascii=False)).msg_type('text').uuid(uuid).build()).build()
         response = self.client.im.v1.message.reply(request)
@@ -199,6 +250,15 @@ class LarkFeishuTransport:
         response = self.client.im.v1.message.create(request)
         return getattr(getattr(response, 'data', None), 'message_id', None)
 
+    def reply_image(self, message_id, chat_id, image, uuid):
+        raise StructuredError('FEISHU_LEGACY_TRANSPORT_DISABLED', 'Image reply requires ChannelFeishuTransport')
+
+    def reply_file(self, message_id, chat_id, path, uuid):
+        raise StructuredError('FEISHU_LEGACY_TRANSPORT_DISABLED', 'File reply requires ChannelFeishuTransport')
+
+    def reply_video(self, message_id, chat_id, path, uuid):
+        raise StructuredError('FEISHU_LEGACY_TRANSPORT_DISABLED', 'Video reply requires ChannelFeishuTransport')
+
     def send_card(self, open_id, card, uuid):
         _require_lark()
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
@@ -208,7 +268,7 @@ class LarkFeishuTransport:
         return getattr(getattr(response, 'data', None), 'message_id', None)
 
     def update_card(self, message_id, card):
-        lark = _require_lark()
+        _require_lark()
         from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
         body = PatchMessageRequestBody.builder().content(json.dumps(card, ensure_ascii=False)).build()
         request = PatchMessageRequest.builder().message_id(message_id).request_body(body).build()
@@ -257,6 +317,7 @@ class ChannelFeishuTransport:
         self._shutdown_blocking_issues = []
         self._shutdown_diagnostic = SdkShutdownDiagnostic()
         self._shutdown_capture = None
+        self._last_event_error = None
 
     @staticmethod
     def _value(obj, *names, default=None):
@@ -297,6 +358,16 @@ class ChannelFeishuTransport:
         sender_open_id = self._value(message, 'sender_id', default=None)
         if not sender_open_id:
             sender_open_id = self._value(sender, 'open_id', 'id', default='')
+        resources = []
+        for resource in self._value(message, 'resources', default=()) or ():
+            resource_type = self._value(resource, 'type', default=None)
+            file_key = self._value(resource, 'file_key', default=None)
+            if resource_type and file_key:
+                resources.append({
+                    'type': str(resource_type),
+                    'file_key': str(file_key),
+                    'file_name': self._value(resource, 'file_name', default=None),
+                })
         return FeishuInboundMessage(
             event_id=self._value(message, 'event_id', default=None),
             message_id=str(message_id),
@@ -314,6 +385,7 @@ class ChannelFeishuTransport:
             body_text=normalized_text,
             sender_is_bot=sender_is_bot,
             reply_to_message_id=self._value(message, 'reply_to_message_id', default=None),
+            resources=tuple(resources),
         )
 
     @staticmethod
@@ -326,10 +398,14 @@ class ChannelFeishuTransport:
     async def _on_message(self, message):
         if self._stopping.is_set():
             return None
-        normalized = self._normalize_message(message)
         if not self._message_handler:
             return None
-        return await self._invoke_handler(self._message_handler, normalized, normalized.event_id)
+        sources = self._value(message, 'batched_sources', default=()) or (message,)
+        result = None
+        for source in sources:
+            normalized = self._normalize_message(source)
+            result = await self._invoke_handler(self._message_handler, normalized, normalized.event_id)
+        return result
 
     async def _on_card(self, event):
         if self._stopping.is_set():
@@ -369,6 +445,13 @@ class ChannelFeishuTransport:
         self._sdk_loop_diagnostic = prepare_channel_sdk_runtime()
         configure_feishu_sdk_logging(self.settings.sdk_log_level)
         channel_kwargs = {'app_id': self.settings.app_id, 'app_secret': self.settings.app_secret}
+        proxy_url = _channel_proxy_url()
+        transport_config = getattr(lark_channel, 'TransportConfig', None)
+        if proxy_url and transport_config is not None:
+            # Pass the proxy explicitly after normalization.  In particular,
+            # this avoids the SDK/websockets stack re-reading GNOME's generic
+            # ``socks://`` value and failing to infer a SOCKS version.
+            channel_kwargs['transport'] = transport_config(proxy_url=proxy_url, trust_env_proxy=False)
         log_level_type = getattr(lark_channel, 'LogLevel', None)
         log_level = getattr(log_level_type, self.settings.sdk_log_level, None) if log_level_type else None
         if log_level is not None:
@@ -378,7 +461,10 @@ class ChannelFeishuTransport:
         channel.on(Events.CARD_ACTION, self._on_card)
         channel.on(Events.RECONNECTING, lambda *_: self._set_state('reconnecting'))
         channel.on(Events.RECONNECTED, lambda *_: self._set_state('ready'))
-        channel.on(Events.ERROR, lambda error=None, *_: self._set_error(error or RuntimeError('channel error')))
+        # The SDK's public ERROR bus also carries ordinary outbound-send and
+        # user-handler failures. Those are request-scoped failures, not proof
+        # that the persistent WebSocket transport died.
+        channel.on(Events.ERROR, lambda error=None, *_: self._observe_event_error(error or RuntimeError('channel error')))
         self._channel = channel
 
     async def _run_channel(self):
@@ -466,6 +552,28 @@ class ChannelFeishuTransport:
         self._set_state('failed')
         self._ready.set()
 
+    def _observe_event_error(self, error):
+        self._last_event_error = {
+            'at': time.time(),
+            'type': type(error).__name__,
+            'message': sanitize_feishu_log_text(error)[:240],
+        }
+        LOGGER.warning(
+            'FEISHU_CHANNEL_EVENT_ERROR type=%s message=%s',
+            self._last_event_error['type'],
+            self._last_event_error['message'],
+        )
+
+    def _sdk_connection_state(self):
+        snapshot = getattr(self._channel, 'connection_snapshot', None)
+        if not callable(snapshot):
+            return None
+        try:
+            value = snapshot()
+        except Exception:
+            return None
+        return str(getattr(value, 'state', '') or '').strip().lower() or None
+
     def _run_loop(self):
         try:
             # Import and construct before creating/running CFR's asyncio loop.
@@ -521,10 +629,35 @@ class ChannelFeishuTransport:
         self._shutdown_diagnostic = SdkShutdownDiagnostic()
         self._shutdown_capture = None
         self._error = None
+        self._last_event_error = None
         self._set_state('starting')
-        self._thread = threading.Thread(target=self._run_loop, name='cfr-feishu-channel', daemon=True)
+        self._thread = threading.Thread(target=self._run_loop_guarded, name='cfr-feishu-channel', daemon=True)
         self._thread.start()
         return self
+
+    def _run_loop_guarded(self):
+        try:
+            self._run_loop()
+        finally:
+            loop = self._loop
+            if loop is not None and not loop.is_closed():
+                try:
+                    if not loop.is_running():
+                        pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                        for task in pending:
+                            task.cancel()
+                        if pending:
+                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                        loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    if not loop.is_running():
+                        loop.close()
+            try:
+                asyncio.set_event_loop(None)
+            except RuntimeError:
+                pass
+            self._loop = None
+            self._owned_loop = None
 
     def connect_until_ready(self, message_handler: Callable | None = None, card_handler: Callable | None = None, timeout=None):
         if self._thread is None or not self._thread.is_alive():
@@ -542,15 +675,22 @@ class ChannelFeishuTransport:
 
     @property
     def is_running(self):
-        return bool(self._thread and self._thread.is_alive()) and self._connection_state not in {'stopped', 'failed'}
+        if not bool(self._thread and self._thread.is_alive()) or self._connection_state in {'stopped', 'failed'}:
+            return False
+        return self._sdk_connection_state() not in {'error', 'stopped', 'closed'}
 
     @property
     def connection_state(self):
-        return self._connection_state
+        sdk_state = self._sdk_connection_state()
+        return 'failed' if sdk_state in {'error', 'stopped', 'closed'} else self._connection_state
 
     @property
     def error(self):
         return self._error
+
+    @property
+    def last_event_error(self):
+        return dict(self._last_event_error) if self._last_event_error else None
 
     def wait_until_stopped(self, timeout=None):
         self._stopped.wait(timeout)
@@ -561,15 +701,29 @@ class ChannelFeishuTransport:
         """Read-only SDK shutdown ownership evidence for probes and gates."""
         return self._shutdown_diagnostic
 
-    def _submit(self, coroutine):
+    def _submit(self, coroutine, *, timeout=None):
         if not self._loop or self._loop.is_closed() or not self.is_running or self._stopping.is_set():
+            # Callers construct native Channel coroutines before crossing this
+            # synchronous boundary.  If the transport has already stopped,
+            # explicitly close the rejected coroutine so Python never reports
+            # "coroutine was never awaited" during the error path.
+            if inspect.iscoroutine(coroutine):
+                coroutine.close()
             raise StructuredError('FEISHU_API_NOT_CONNECTED', 'Feishu Channel SDK is not connected')
-        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
         try:
-            return future.result(timeout=self.outbound_timeout)
+            future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        except Exception:
+            if inspect.iscoroutine(coroutine):
+                coroutine.close()
+            raise
+        try:
+            return future.result(timeout=self.outbound_timeout if timeout is None else float(timeout))
         except StructuredError:
             future.cancel()
             raise
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise StructuredError('FEISHU_API_TIMEOUT', 'Feishu outbound delivery timed out') from exc
         except Exception as exc:
             future.cancel()
             raise StructuredError('FEISHU_API_UNKNOWN', 'Feishu outbound delivery failed') from exc
@@ -581,6 +735,62 @@ class ChannelFeishuTransport:
         result = self._submit(self._send(chat_id, {'text': text}, {'reply_to': message_id, 'uuid': uuid}))
         return _require_send_success(result)
 
+    def reply_image(self, message_id, chat_id, image, uuid):
+        result = self._submit(self._send(chat_id, {'image': bytes(image)}, {'reply_to': message_id, 'uuid': uuid}))
+        return _require_send_success(result)
+
+    def reply_file(self, message_id, chat_id, path, uuid):
+        path = Path(path).resolve(strict=True)
+        result = self._submit(self._send(
+            chat_id,
+            {'file': {'source': str(path), 'file_name': path.name}},
+            {'reply_to': message_id, 'uuid': uuid},
+        ), timeout=max(60.0, self.outbound_timeout))
+        return _require_send_success(result)
+
+    def reply_video(self, message_id, chat_id, path, uuid):
+        path = Path(path).resolve(strict=True)
+        result = self._submit(self._send(
+            chat_id,
+            {'video': {'source': str(path)}},
+            {'reply_to': message_id, 'uuid': uuid},
+        ), timeout=max(60.0, self.outbound_timeout))
+        return _require_send_success(result)
+
+    def upload_image(self, image):
+        from lark_channel.channel.types import MediaSource
+        key = self._submit(self._channel.upload_media(MediaSource(kind='buffer', buffer=bytes(image)), kind='image'))
+        if not key:
+            raise StructuredError('FEISHU_IMAGE_UPLOAD_FAILED', 'Feishu image upload returned no image key')
+        return str(key)
+
+    def reply_image_key(self, message_id, chat_id, image_key, uuid):
+        result = self._submit(self._send(chat_id, {'image': {'source': str(image_key)}}, {'reply_to': message_id, 'uuid': uuid}))
+        return _require_send_success(result)
+
+    def download_image(self, image_key, message_id=None):
+        data = self._submit(self._channel.download_resource(str(image_key), 'image', message_id=message_id))
+        if not data:
+            raise StructuredError('FEISHU_IMAGE_DOWNLOAD_FAILED', 'Feishu image download returned no data')
+        return bytes(data)
+
+    def download_image_to_file(self, image_key, dest_dir, message_id=None):
+        path = self._submit(self._channel.download_resource_to_file(
+            str(image_key), resource_type='image', message_id=message_id, dest_dir=Path(dest_dir),
+        ), timeout=max(60.0, self.outbound_timeout))
+        if not path:
+            raise StructuredError('FEISHU_IMAGE_DOWNLOAD_FAILED', 'Feishu image download returned no local path')
+        return Path(path).resolve()
+
+    def download_file_to_file(self, file_key, dest_dir, message_id=None, file_name=None, resource_type='file'):
+        path = self._submit(self._channel.download_resource_to_file(
+            str(file_key), resource_type=resource_type, message_id=message_id,
+            dest_dir=Path(dest_dir), file_name=file_name,
+        ), timeout=max(60.0, self.outbound_timeout))
+        if not path:
+            raise StructuredError('FEISHU_FILE_DOWNLOAD_FAILED', f'Feishu {resource_type} download returned no local path')
+        return Path(path).resolve()
+
     def send_text(self, open_id, text, uuid):
         return _require_send_success(self._submit(self._send(open_id, {'text': text}, {'uuid': uuid})))
 
@@ -588,7 +798,13 @@ class ChannelFeishuTransport:
         return _require_send_success(self._submit(self._send(open_id, {'card': card}, {'uuid': uuid})))
 
     async def _update_card(self, message_id, card):
-        return await self._channel.update_card(message_id, card)
+        # Progress is optional telemetry, not the task deliverable.  Never let
+        # one slow card mutation occupy the outbound channel for the full final
+        # delivery timeout; disable that progress stream quickly instead.
+        return await asyncio.wait_for(
+            self._channel.update_card(message_id, card),
+            timeout=min(3.0, self.outbound_timeout),
+        )
 
     def update_card(self, message_id, card):
         return _require_send_success(self._submit(self._update_card(message_id, card)))

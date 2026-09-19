@@ -68,13 +68,14 @@ class RedirectTests(unittest.TestCase):
         self.daemon.parser = CommandParser()
         self.daemon.replies = _Replies()
         self.daemon.store = self.store
+        self.daemon.settings = SimpleNamespace(allowed_workspace_roots=(Path(self.directory.name),))
         self.daemon.adapter = _Adapter()
         self.daemon.binding_store = SimpleNamespace(get_binding=lambda _thread: SimpleNamespace(cwd=Path(self.directory.name)))
         self.daemon.approvals = SimpleNamespace(finalize_feedback_for_turn=lambda **_kwargs: None)
         self.daemon._locks = {}
         self.daemon._locks_guard = threading.RLock()
         self.queued = []
-        self.daemon.enqueue = self.queued.append
+        self.daemon.enqueue = lambda message_id, _chat_id=None: self.queued.append(message_id)
         self.message = FeishuInboundMessage('event', 'message', 'chat', 'p2p', 'user', 'user', 'text', '/redirect NEW_DIRECTION')
 
     def tearDown(self):

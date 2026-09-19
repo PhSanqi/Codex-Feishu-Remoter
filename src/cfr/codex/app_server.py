@@ -1,4 +1,4 @@
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 import json
 import os
@@ -12,7 +12,13 @@ from typing import Any, Callable
 from dataclasses import dataclass
 
 from .launcher import CodexLauncher
-from cfr.network import proxy_child_env, resolve_proxy
+from cfr.network import proxy_child_env, resolve_cfr_proxy
+from cfr.platform import hidden_subprocess_kwargs
+
+
+DIAGNOSTIC_QUEUE_LIMIT = 256
+SERVER_REQUEST_THREAD_LIMIT = 16
+FILE_CHANGE_PROJECTION_LIMIT = 200
 
 
 class AppServerRpcError(Exception):
@@ -81,7 +87,7 @@ class NotificationDispatcher:
 
 
 class AppServerClient:
-    def __init__(self, launcher=None, timeout=30, on_server_request=None, process_env=None, config_overrides=None, codex_home=None):
+    def __init__(self, launcher=None, timeout=30, on_server_request=None, on_server_notification=None, process_env=None, config_overrides=None, codex_home=None):
         self.launcher = launcher or CodexLauncher(config_overrides=config_overrides)
         self.timeout = timeout
         self._id = 0
@@ -89,19 +95,23 @@ class AppServerClient:
         self._write_lock = threading.Lock()
         self._pending = {}
         self._pending_lock = threading.RLock()
-        self.notifications = queue.Queue()
+        self.notifications = queue.Queue(maxsize=DIAGNOSTIC_QUEUE_LIMIT)
         self.dispatcher = NotificationDispatcher()
-        self.server_requests = queue.Queue()
+        self.server_requests = queue.Queue(maxsize=DIAGNOSTIC_QUEUE_LIMIT)
+        self._server_request_slots = threading.BoundedSemaphore(SERVER_REQUEST_THREAD_LIMIT)
         self.stderr = deque(maxlen=100)
         self._server_request_handler = on_server_request or self._reject_server_request
+        self._server_notification_handler = on_server_notification
         self._server_request_response_lock = threading.RLock()
         self._resolved_server_request_ids: set[str | int] = set()
         self._inflight_server_request_ids: set[str | int] = set()
+        self._file_change_projection: OrderedDict[tuple[str, str, str], tuple[str, ...]] = OrderedDict()
+        self._file_change_projection_lock = threading.RLock()
         # CFR-owned Codex processes inherit a detected fixed system proxy through
         # standard proxy environment variables. This keeps CFR independent from
         # Codex's experimental `respect_system_proxy` feature. Callers that need
         # an intentionally unmodified environment can pass an explicit dict.
-        self.process_env = dict(process_env) if process_env is not None else dict(proxy_child_env(resolve_proxy()) or {})
+        self.process_env = dict(process_env) if process_env is not None else dict(proxy_child_env(resolve_cfr_proxy()) or {})
         self.codex_home = Path(codex_home) if codex_home else None
         self.proc = None
         self._closing = False
@@ -150,6 +160,12 @@ class AppServerClient:
     def start(self):
         if self.is_running:
             return self
+        for diagnostic in (self.notifications, self.server_requests):
+            while True:
+                try:
+                    diagnostic.get_nowait()
+                except queue.Empty:
+                    break
         started = self.app_server_start_started_at = time.monotonic()
         child_env = dict(self.process_env or {})
         if self.codex_home is not None:
@@ -163,7 +179,7 @@ class AppServerClient:
             encoding='utf-8',
             bufsize=1,
             env={**os.environ, **child_env} if child_env else None,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0,
+            **hidden_subprocess_kwargs(new_process_group=True),
         )
         self.app_server_started_at = time.monotonic()
         self.app_server_start_elapsed_ms = int((self.app_server_started_at - started) * 1000)
@@ -171,6 +187,8 @@ class AppServerClient:
         with self._server_request_response_lock:
             self._resolved_server_request_ids.clear()
             self._inflight_server_request_ids.clear()
+        with self._file_change_projection_lock:
+            self._file_change_projection.clear()
         self.started_at = self._timestamp()
         self.close_started_at = None
         self.exited_at = None
@@ -181,7 +199,11 @@ class AppServerClient:
         self._stderr_thread.start()
         try:
             initialized = self.initialize_started_at = time.monotonic()
-            self.request('initialize', {'clientInfo': {'name': 'cfr', 'version': '0.1'}, 'capabilities': {'experimentalApi': True}})
+            self.request(
+                'initialize',
+                {'clientInfo': {'name': 'cfr', 'version': '0.1'}, 'capabilities': {'experimentalApi': True}},
+                timeout=max(5.0, float(self.timeout)),
+            )
             self.initialize_completed_at = time.monotonic()
             self.initialize_elapsed_ms = int((self.initialize_completed_at - initialized) * 1000)
             self.notify('initialized', {})
@@ -199,26 +221,49 @@ class AppServerClient:
             self.proc.stdin.flush()
 
     def _read(self):
+        stream = self.proc.stdout if self.proc else None
+        if not stream:
+            return
         try:
-            for line in self.proc.stdout:
+            for line in stream:
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError:
-                    self.notifications.put({'method': 'cfr/malformed', 'params': {'line': line.rstrip()}})
+                    self._put_diagnostic(self.notifications, {'method': 'cfr/malformed', 'params': {'line': line.rstrip()}})
                     continue
                 request_id = message.get('id')
                 if request_id is not None and ('result' in message or 'error' in message):
                     with self._pending_lock:
                         pending = self._pending.get(request_id)
                     if pending:
-                        pending.put(message)
+                        try:
+                            pending.put_nowait(message)
+                        except queue.Full:
+                            pass
                     continue
                 if request_id is not None and message.get('method'):
-                    self.server_requests.put(message)
-                    threading.Thread(target=self._handle_server_request, args=(message,), daemon=True).start()
+                    self._put_diagnostic(self.server_requests, message)
+                    if self._server_request_slots.acquire(blocking=False):
+                        threading.Thread(target=self._handle_server_request_bounded, args=(message,), daemon=True).start()
+                    else:
+                        self.respond_server_request(
+                            request_id,
+                            error={'code': -32001, 'message': 'CODEX_SERVER_REQUEST_OVERLOADED'},
+                        )
                     continue
                 if message.get('method'):
-                    self.notifications.put(message)
+                    self._record_file_change_projection(message)
+                    if self._server_notification_handler is not None and message.get('method') in {
+                        'serverRequest/resolved', 'turn/completed', 'turn/interrupted'
+                    }:
+                        try:
+                            self._server_notification_handler(message)
+                        except Exception:
+                            self._put_diagnostic(
+                                self.notifications,
+                                {'method': 'cfr/serverNotificationHandlerFailed', 'params': {'sourceMethod': message.get('method')}},
+                            )
+                    self._put_diagnostic(self.notifications, message)
                     self.dispatcher.publish(message)
         finally:
             if not self._closing:
@@ -235,17 +280,77 @@ class AppServerClient:
         if request_id is None:
             return
         try:
-            resolution = self._server_request_handler(message)
+            resolution = self._server_request_handler(self._enrich_server_request(message))
             if isinstance(resolution, ServerRequestResolution):
                 result, error = resolution.result, resolution.error
             elif isinstance(resolution, dict) and 'error' in resolution and set(resolution).issubset({'error'}):
                 result, error = None, resolution['error']
             else:
                 result, error = resolution, None
-        except Exception as exc:
+        except Exception:
             result = None
             error = {'code': -32000, 'message': 'CODEX_SERVER_REQUEST_HANDLER_FAILED'}
         self.respond_server_request(request_id, result=result, error=error)
+
+    @staticmethod
+    def _file_change_key(params):
+        if not isinstance(params, dict):
+            return None
+        thread_id = params.get('threadId')
+        turn_id = params.get('turnId')
+        item_id = params.get('itemId')
+        if not thread_id or not turn_id or not item_id:
+            return None
+        return str(thread_id), str(turn_id), str(item_id)
+
+    def _record_file_change_projection(self, message):
+        if not isinstance(message, dict) or message.get('method') != 'item/fileChange/patchUpdated':
+            return
+        params = message.get('params') or {}
+        key = self._file_change_key(params)
+        if key is None:
+            return
+        paths = tuple(
+            str(change.get('path'))
+            for change in (params.get('changes') or ())
+            if isinstance(change, dict) and change.get('path')
+        )
+        if not paths:
+            return
+        with self._file_change_projection_lock:
+            self._file_change_projection.pop(key, None)
+            self._file_change_projection[key] = paths
+            while len(self._file_change_projection) > FILE_CHANGE_PROJECTION_LIMIT:
+                self._file_change_projection.popitem(last=False)
+
+    def _enrich_server_request(self, message, wait_seconds=0.35):
+        if not isinstance(message, dict) or message.get('method') != 'item/fileChange/requestApproval':
+            return message
+        params = message.get('params') or {}
+        key = self._file_change_key(params)
+        if key is None:
+            return message
+        deadline = time.monotonic() + max(0.0, float(wait_seconds))
+        paths = None
+        while paths is None:
+            with self._file_change_projection_lock:
+                paths = self._file_change_projection.get(key)
+            if paths is not None or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        if not paths:
+            return message
+        enriched = dict(message)
+        enriched_params = dict(params)
+        enriched_params['_cfrChangedPaths'] = list(paths)
+        enriched['params'] = enriched_params
+        return enriched
+
+    def _handle_server_request_bounded(self, message):
+        try:
+            self._handle_server_request(message)
+        finally:
+            self._server_request_slots.release()
 
     def _reject_server_request(self, message):
         return ServerRequestResolution(error={'code': -32601, 'message': 'UNSUPPORTED_CODEX_SERVER_REQUEST'})
@@ -282,7 +387,27 @@ class AppServerClient:
         with self._pending_lock:
             pending = list(self._pending.values())
         for waiter in pending:
-            waiter.put(error)
+            try:
+                waiter.put_nowait(error)
+            except queue.Full:
+                pass
+
+    @staticmethod
+    def _put_diagnostic(target, value):
+        """Keep diagnostic mirrors bounded without affecting authority queues."""
+        try:
+            target.put_nowait(value)
+            return
+        except queue.Full:
+            pass
+        try:
+            target.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            target.put_nowait(value)
+        except queue.Full:
+            pass
 
     def request(self, method, params, timeout=None):
         if self._closing or not self.proc or self.proc.poll() is not None:
@@ -298,7 +423,7 @@ class AppServerClient:
             try:
                 response = waiter.get(timeout=timeout or self.timeout)
             except queue.Empty:
-                raise TimeoutError(f'{method} timed out')
+                raise TimeoutError(f'{method} timed out') from None
             if isinstance(response, Exception):
                 raise response
             if 'error' in response:
@@ -326,7 +451,7 @@ class AppServerClient:
             message = subscription.get(timeout=timeout or self.timeout)
             return message.get('params', {})
         except queue.Empty:
-            raise TimeoutError(f'{method} timed out')
+            raise TimeoutError(f'{method} timed out') from None
         finally:
             subscription.close()
 
@@ -338,27 +463,35 @@ class AppServerClient:
         self.close_started_at = self._timestamp()
         self._closing = True
         self._fail_pending(RuntimeError('app-server closed'))
-        if self.proc.poll() is not None:
-            self.close_mode = 'already_exited'
-            self.exited_at = self.exited_at or self._timestamp()
-            return
         try:
-            if self.proc.stdin and not self.proc.stdin.closed:
-                self.proc.stdin.close()
-            if os.name == 'nt':
-                try:
-                    self.proc.send_signal(signal.CTRL_BREAK_EVENT)
-                except OSError:
-                    pass
-                self.close_mode = 'break'
-            self.proc.wait(timeout=0.5 if os.name == 'nt' else 2)
-            self.close_mode = self.close_mode or 'graceful'
+            if self.proc.poll() is not None:
+                self.close_mode = 'already_exited'
+            else:
+                # On Windows the npm/cmd wrapper can stop consuming stdin while its
+                # child app-server is shutting down. TextIOWrapper.close() flushes
+                # first, so terminate the owned process group before closing pipes.
+                if os.name != 'nt' and self.proc.stdin and not self.proc.stdin.closed:
+                    self.proc.stdin.close()
+                if os.name == 'nt':
+                    try:
+                        # Tests and cross-platform validation can exercise the
+                        # Windows shutdown branch on a non-Windows interpreter,
+                        # where CTRL_BREAK_EVENT is not defined.  The real
+                        # Windows runtime still uses CTRL_BREAK_EVENT; SIGTERM is
+                        # only a portable fallback for that synthetic case.
+                        self.proc.send_signal(getattr(signal, 'CTRL_BREAK_EVENT', signal.SIGTERM))
+                    except OSError:
+                        pass
+                    self.close_mode = 'break'
+                self.proc.wait(timeout=0.5 if os.name == 'nt' else 2)
+                self.close_mode = self.close_mode or 'graceful'
         except subprocess.TimeoutExpired:
             if os.name == 'nt':
                 self.close_mode = 'kill_tree'
                 subprocess.run(
                     ['taskkill', '/PID', str(self.proc.pid), '/T', '/F'],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=False,
+                    **hidden_subprocess_kwargs(),
                 )
                 try:
                     self.proc.wait(timeout=0.5)

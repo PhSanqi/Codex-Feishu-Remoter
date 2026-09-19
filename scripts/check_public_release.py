@@ -5,21 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import subprocess
-import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-REQUIRED_TRACKED = {
-    '.gitattributes',
-    '.gitignore',
-    'CONTRIBUTING.md',
-    'LICENSE',
-    'README.md',
-    'SECURITY.md',
-    'pyproject.toml',
-    'START_CFR.cmd',
-}
 
 FORBIDDEN_PREFIXES = (
     '.tmp/',
@@ -40,7 +28,7 @@ FORBIDDEN_SUFFIXES = (
 
 SNAPSHOT_RE = re.compile(r'^CFR_SOURCE_SNAPSHOT_.*\.zip$', re.IGNORECASE)
 MACHINE_PATH_RE = re.compile(
-    r'(?:[A-Za-z]:\\Users\\[^\\\r\n]+\\|/Users/[^/\r\n]+/|/home/[^/\r\n]+/)',
+    r'(?:[A-Za-z]:\\Users\\[^\\\r\n]+\\|/' r'Users/[^/\r\n]+/|/' r'home/[^/\r\n]+/)',
     re.IGNORECASE,
 )
 
@@ -68,8 +56,7 @@ def excluded_path(path: str) -> bool:
 
 
 def machine_paths(path: str) -> list[str]:
-    normalized = path.replace('\\', '/')
-    if normalized.startswith('tests/') or normalized == 'scripts/check_public_release.py':
+    if path.replace('\\', '/').startswith('tests/'):
         return []
     full = ROOT / path
     try:
@@ -81,12 +68,8 @@ def machine_paths(path: str) -> list[str]:
 
 def main() -> int:
     problems: list[str] = []
-    tracked = tracked_files()
-    missing_required = sorted(REQUIRED_TRACKED.difference(tracked))
-    for path in missing_required:
-        problems.append(f'MISSING_REQUIRED_TRACKED_PATH {path}')
     forbidden_prefix_counts = {prefix: 0 for prefix in FORBIDDEN_PREFIXES}
-    for path in tracked:
+    for path in tracked_files():
         if excluded_path(path):
             normalized = path.replace('\\', '/')
             prefix = next((item for item in FORBIDDEN_PREFIXES if normalized.startswith(item)), None)

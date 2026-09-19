@@ -8,6 +8,7 @@ from typing import Any
 from cfr.codex.app_server import AppServerClient, AppServerRpcError
 
 from .codex_catalog import model_catalog
+from .model_registry import default_model, resolve_model
 
 
 _TIMEOUT_SECONDS = 15
@@ -35,15 +36,6 @@ def _source(origins: Mapping[str, Any], key: str, fallback: str = 'unknown') -> 
     return _text(_mapping(metadata.get('name')).get('type')) or fallback
 
 
-def _default_model(catalog: list[dict[str, Any]]) -> dict[str, Any] | None:
-    defaults = [model for model in catalog if model.get('is_default') and model.get('model')]
-    return defaults[0] if len(defaults) == 1 else None
-
-
-def _model_by_slug(catalog: list[dict[str, Any]], model: str | None) -> dict[str, Any] | None:
-    return next((item for item in catalog if item.get('model') == model), None)
-
-
 def _requirements(response: Mapping[str, Any] | None) -> dict[str, str | None]:
     new_thread = _mapping(_mapping(_mapping(response).get('requirements')).get('models')).get('newThread')
     return {
@@ -56,10 +48,10 @@ def _requirements(response: Mapping[str, Any] | None) -> dict[str, str | None]:
 def _project(config_response: Mapping[str, Any], requirements_response: Mapping[str, Any] | None, catalog: list[dict[str, Any]]) -> dict[str, Any]:
     config = _mapping(config_response.get('config'))
     origins = _mapping(config_response.get('origins'))
-    default_model = _default_model(catalog)
+    runtime_default = default_model(catalog)
     configured_model = _text(config.get('model'))
-    effective_model = configured_model or (default_model or {}).get('model')
-    selected_model = _model_by_slug(catalog, effective_model)
+    effective_model = configured_model or (runtime_default or {}).get('model')
+    selected_model = resolve_model(catalog, effective_model, display_name=False)
     configured_reasoning = _text(config.get('model_reasoning_effort'))
     configured_tier = _text(config.get('service_tier'))
     return {
@@ -124,7 +116,7 @@ def _validate(values: Any, catalog: list[dict[str, Any]]) -> tuple[str | None, s
     model, reasoning, tier = (values[key] for key in ('model', 'reasoning_effort', 'service_tier'))
     if any(value is not None and not isinstance(value, str) for value in (model, reasoning, tier)):
         raise CodexSettingsError('CONTROL_INVALID_CODEX_SETTING', 'Model defaults must be strings or null.')
-    selected = _model_by_slug(catalog, model) if model else _default_model(catalog)
+    selected = resolve_model(catalog, model, display_name=False) if model else default_model(catalog)
     if model and selected is None:
         raise CodexSettingsError('CONTROL_INVALID_CODEX_SETTING', 'Selected model is unavailable in the installed Codex catalog.')
     if selected is None and (reasoning or tier):

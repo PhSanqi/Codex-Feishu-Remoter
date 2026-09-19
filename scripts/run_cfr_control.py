@@ -90,7 +90,7 @@ def main(argv=None):
         _emit({
             'status': 'error',
             'error_code': 'CONTROL_UI_BUILD_MISSING',
-            'message': 'Control UI build is missing. Run: cd m3_control && npm.cmd run build',
+            'message': 'Control UI build is missing. Run: cd m3_control && npm run build',
         }, args.quiet)
         return 2
     if _existing_cfr(args.port):
@@ -131,8 +131,29 @@ def main(argv=None):
             'url': root_url,
         }, args.quiet)
         return 1
+    # Make the local control plane visible before optional Codex/Chat/Feishu
+    # readiness probes. Those probes can take seconds on a cold machine.
     browser_opened = _browser_opened(server.bootstrap_url, args.open_browser)
-    payload = {'status': 'started', 'url': server.bootstrap_url}
+    setup = supervisor.setup_state()
+    browser_runtime = {'status': 'not_started'}
+    feishu_runtime = None
+    if setup.get('ready'):
+        chat_ready = True
+        if setup.get('selected_surface') == 'chat':
+            browser_runtime = supervisor.start_browser_bridge()
+            chat_ready = bool(browser_runtime.get('available'))
+        if chat_ready:
+            feishu_runtime = supervisor.start_feishu()
+    payload = {
+        'status': 'started',
+        'url': server.bootstrap_url,
+        'chat_browser': browser_runtime.get('status') if isinstance(browser_runtime, dict) else 'unknown',
+        'setup_ready': bool(setup.get('ready')),
+        'feishu': 'running' if getattr(feishu_runtime, 'status', None) == 'ok' else 'not_started' if feishu_runtime is None else 'error',
+    }
+    feishu_error_code = getattr(feishu_runtime, 'error_code', None)
+    if isinstance(feishu_error_code, str) and feishu_error_code:
+        payload['feishu_error_code'] = feishu_error_code
     if browser_opened is not None:
         payload['browser_opened'] = browser_opened
     _emit(payload, args.quiet)

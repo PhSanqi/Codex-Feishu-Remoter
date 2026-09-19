@@ -8,15 +8,11 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import sys
 import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ROOT_FILES = (
-    '.gitattributes', '.gitignore', 'CONTRIBUTING.md', 'LICENSE', 'README.md',
-    'SECURITY.md', 'pyproject.toml', 'START_CFR.cmd',
-)
+ROOT_FILES = ('README.md', 'pyproject.toml', 'START_CFR.cmd')
 SOURCE_DIRS = ('src', 'scripts', 'tests', 'docs')
 M3_FILES = ('index.html', 'package.json', 'package-lock.json', 'tsconfig.json', 'vite.config.ts')
 FORBIDDEN_DIRS = {
@@ -82,6 +78,14 @@ def _verify(path: Path):
     return len(entries)
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest().upper()
+
+
 def write_snapshot(root: Path, round_id: str):
     output = _target(root, round_id)
     try:
@@ -94,7 +98,7 @@ def write_snapshot(root: Path, round_id: str):
         raise
     return {
         'SourceSnapshotFile': output.name,
-        'SourceSnapshotSha256': hashlib.sha256(output.read_bytes()).hexdigest().upper(),
+        'SourceSnapshotSha256': _sha256(output),
         'SourceSnapshotEntryCount': entries,
         'SourceSnapshotForbiddenEntries': 'NONE',
     }

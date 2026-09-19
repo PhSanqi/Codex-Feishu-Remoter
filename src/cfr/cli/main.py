@@ -2,11 +2,14 @@ import argparse
 import asyncio
 import getpass
 import json
+import sqlite3
+import sys
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from cfr.codex.binding import CodexAdapter
+from cfr.codex.approvals import CodexApprovalCodec
 from cfr.codex.launcher import CodexLauncher
 from cfr.codex.rollout import RolloutWatcher
 from cfr.core.models import StructuredError
@@ -28,6 +31,55 @@ def _json_value(value):
 
 def _print(value):
     print(json.dumps(_json_value(value), ensure_ascii=False, default=str))
+
+
+def _console_server_request(message):
+    """Handle the CFR CLI's supported Codex server requests without auto-approval."""
+    method = message.get('method') if isinstance(message, dict) else None
+    params = (message.get('params') or {}) if isinstance(message, dict) else {}
+    if method == 'currentTime/read':
+        return {'currentTimeAt': int(time.time())}
+    if method == 'item/tool/requestUserInput':
+        questions = [item for item in (params.get('questions') or ()) if isinstance(item, dict)]
+        if not questions or not sys.stdin.isatty():
+            return {'error': {'code': -32014, 'message': 'CFR_CLI_USER_INPUT_UNAVAILABLE'}}
+        answers = {}
+        for index, question in enumerate(questions, 1):
+            header = str(question.get('header') or f'Question {index}')
+            prompt = str(question.get('question') or '').strip()
+            print(f'\n[{header}] {prompt}')
+            options = [item for item in (question.get('options') or ()) if isinstance(item, dict)]
+            for option_index, option in enumerate(options, 1):
+                label = str(option.get('label') or '')
+                description = str(option.get('description') or '')
+                print(f'  {option_index}. {label}' + (f' - {description}' if description else ''))
+            value = getpass.getpass('Answer: ') if question.get('isSecret') else input('Answer: ')
+            value = value.strip()
+            if options and value.isdigit() and 1 <= int(value) <= len(options):
+                value = str(options[int(value) - 1].get('label') or value)
+            answers[str(question.get('id') or index)] = {'answers': [value]}
+        return {'answers': answers}
+
+    codec = CodexApprovalCodec()
+    thread_id = str(params.get('threadId') or params.get('conversationId') or '')
+    request = codec.decode(message, thread_id)
+    if request is None:
+        return {'error': {'code': -32601, 'message': 'UNSUPPORTED_CODEX_SERVER_REQUEST'}}
+    print(f'\nCodex approval required: {request.kind}')
+    if request.cwd:
+        print(f'Workspace: {request.cwd}')
+    if request.command:
+        print(f'Command: {request.command}')
+    if request.changed_paths:
+        print('Changed paths: ' + ', '.join(request.changed_paths))
+    if request.requested_permissions:
+        print('Requested permissions: ' + json.dumps(request.requested_permissions, ensure_ascii=False))
+    if request.reason:
+        print(f'Reason: {request.reason}')
+    if not sys.stdin.isatty():
+        return codec.response('decline', request)
+    approved = input('Approve once? [y/N] ').strip().lower() in {'y', 'yes'}
+    return codec.response('accept' if approved else 'decline', request)
 
 
 def _parser():
@@ -195,9 +247,15 @@ def main(argv=None):
     try:
         adapter = CodexAdapter(store=store, launcher=CodexLauncher(executable=args.codex_bin), codex_home=args.codex_home)
         if args.op == 'new':
-            _print(asyncio.run(adapter.create_conversation(Path(args.cwd), args.name, args.message)))
+            _print(asyncio.run(adapter.create_conversation(
+                Path(args.cwd), args.name, args.message,
+                on_server_request=_console_server_request,
+            )))
         elif args.op == 'send':
-            _print(asyncio.run(adapter.send_message(args.thread_id, args.message)))
+            _print(asyncio.run(adapter.send_message(
+                args.thread_id, args.message,
+                on_server_request=_console_server_request,
+            )))
         elif args.op == 'list':
             _print(store.list_bindings())
         elif args.op == 'status':
@@ -215,6 +273,12 @@ def main(argv=None):
 
 
 def _watch(store, thread_id, interval, once):
+    try:
+        store.prune_event_dedupe()
+    except sqlite3.Error:
+        # This table is a secondary duplicate guard. Retention maintenance
+        # must not prevent the native rollout watcher from starting.
+        pass
     binding = store.get_binding(thread_id)
     if not binding:
         raise StructuredError('BINDING_NOT_FOUND', f'No binding for {thread_id}')

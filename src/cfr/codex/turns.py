@@ -1,10 +1,10 @@
-from datetime import datetime, timezone
 from collections import OrderedDict
+import math
 import threading
 import time
 import uuid
 
-from cfr.core.models import ActiveTurn, TurnResult, TurnTelemetry
+from cfr.core.models import ActiveTurn, StructuredError, TurnResult, TurnTelemetry
 
 
 RECENT_TURN_LIMIT = 20
@@ -44,8 +44,22 @@ class ActiveTurnRegistry:
                 oldest, _ = self._telemetry.popitem(last=False)
                 self._pending.pop(oldest, None)
 
+    def complete_telemetry(self, telemetry):
+        if telemetry is None:
+            return
+        with self._lock:
+            self._pending.pop(telemetry.correlation_id, None)
+            self._telemetry.pop(telemetry.correlation_id, None)
+            self._telemetry[telemetry.correlation_id] = telemetry
+            while len(self._telemetry) > RECENT_TURN_LIMIT:
+                oldest, _ = self._telemetry.popitem(last=False)
+                self._pending.pop(oldest, None)
+
     def register(self, active: ActiveTurn):
         with self._lock:
+            # A thread can run many turns.  Do not let wait() observe the
+            # previous turn's terminal result while the new turn is active.
+            self._results.pop(active.thread_id, None)
             self._active[active.thread_id] = active
             self._done[active.thread_id] = threading.Event()
             if active.telemetry is not None:
@@ -66,12 +80,11 @@ class ActiveTurnRegistry:
             self._results.pop(result.thread_id, None)
             self._results[result.thread_id] = result
             while len(self._results) > RECENT_TURN_LIMIT:
-                self._results.popitem(last=False)
+                evicted_thread_id, _ = self._results.popitem(last=False)
+                self._done.pop(evicted_thread_id, None)
             self._active.pop(result.thread_id, None)
             if result.telemetry is not None:
-                self._pending.pop(result.telemetry.correlation_id, None)
-                self._telemetry.pop(result.telemetry.correlation_id, None)
-                self._telemetry[result.telemetry.correlation_id] = result.telemetry
+                self.complete_telemetry(result.telemetry)
             event = self._done.get(result.thread_id)
             if event:
                 event.set()
@@ -126,11 +139,64 @@ class TurnManager:
             return item.get('text') or ''
         return ''
 
-    def start_turn(self, thread_id, text):
+    @staticmethod
+    def _user_input(text, attachments=None):
+        items = []
+        if text:
+            items.append({'type': 'text', 'text': text})
+        for item in attachments or ():
+            if not isinstance(item, dict) or item.get('type') not in {'localImage', 'mention'}:
+                raise StructuredError('CODEX_ATTACHMENT_INVALID', 'Codex attachment must use native localImage or mention input')
+            items.append(dict(item))
+        if not items:
+            raise StructuredError('CODEX_INPUT_REQUIRED', 'Codex turn requires text or an attachment')
+        return items
+
+    def start_turn(self, thread_id, text, attachments=None):
         return self.client.request('turn/start', {
             'threadId': thread_id,
-            'input': [{'type': 'text', 'text': text}],
+            'input': self._user_input(text, attachments),
         })
+
+    def _timeout_result(self, thread_id, turn_id, deltas, started_at, telemetry, on_progress):
+        """Interrupt the native turn before publishing CFR's timeout result."""
+        interrupt_status = 'requested'
+        try:
+            try:
+                self.client.request(
+                    'turn/interrupt',
+                    {'threadId': thread_id, 'turnId': turn_id},
+                    timeout=min(3.0, float(getattr(self.client, 'timeout', 3.0) or 3.0)),
+                )
+            except TypeError:
+                # Compatibility with small protocol fakes and older clients.
+                self.client.request('turn/interrupt', {'threadId': thread_id, 'turnId': turn_id})
+            telemetry.add_event('Timeout interrupt requested', status='requested')
+        except Exception as exc:
+            interrupt_status = f'failed:{type(exc).__name__}'
+            telemetry.add_event('Timeout interrupt failed', status=interrupt_status)
+        telemetry.mark('turn_completed_at')
+        telemetry.set_stage('timed_out', status='timed_out', event='Turn timed out')
+        result = TurnResult(
+            thread_id,
+            turn_id,
+            'timeout',
+            ''.join(deltas.values()),
+            started_at,
+            int(time.time()),
+            None if interrupt_status == 'requested' else f'Native timeout interrupt {interrupt_status}',
+            telemetry,
+        )
+        self.registry.finish(result)
+        self._progress(
+            on_progress,
+            state='timed_out',
+            thread_id=thread_id,
+            turn_id=turn_id,
+            steer_available=False,
+            stage='timed_out',
+        )
+        return result
 
     @staticmethod
     def _progress(callback, **values):
@@ -140,8 +206,14 @@ class TurnManager:
             except Exception:
                 pass
 
-    def run_turn(self, thread_id, text, timeout=None, *, turn_timeout=None, on_progress=None, telemetry=None):
-        timeout = turn_timeout if turn_timeout is not None else timeout or self.client.timeout
+    def run_turn(self, thread_id, text, timeout=None, *, turn_timeout=None, on_progress=None, telemetry=None, attachments=None):
+        timeout = turn_timeout if turn_timeout is not None else timeout if timeout is not None else self.client.timeout
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError) as exc:
+            raise StructuredError('CODEX_TURN_TIMEOUT_INVALID', 'Codex turn timeout must be a positive number') from exc
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise StructuredError('CODEX_TURN_TIMEOUT_INVALID', 'Codex turn timeout must be a positive finite number')
         started_at = int(time.time())
         telemetry = telemetry or self.registry.begin(
             f'local-{uuid.uuid4().hex}', thread_id=thread_id,
@@ -156,7 +228,7 @@ class TurnManager:
         preview = ''
         try:
             telemetry.mark('turn_start_requested_at')
-            response = self.start_turn(thread_id, text)
+            response = self.start_turn(thread_id, text, attachments)
             turn_id = self._turn_id(response)
             telemetry.mark('turn_started_at')
             telemetry.set_identity(turn_id=turn_id)
@@ -168,12 +240,7 @@ class TurnManager:
             while completed is None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    telemetry.mark('turn_completed_at')
-                    telemetry.set_stage('timed_out', status='timed_out', event='Turn timed out')
-                    result = TurnResult(thread_id, turn_id, 'timeout', ''.join(deltas.values()), started_at, int(time.time()), telemetry=telemetry)
-                    self.registry.finish(result)
-                    self._progress(on_progress, state='timed_out', thread_id=thread_id, turn_id=turn_id, steer_available=False, stage='timed_out')
-                    return result
+                    return self._timeout_result(thread_id, turn_id, deltas, started_at, telemetry, on_progress)
                 try:
                     message = subscription.get(timeout=remaining)
                 except Exception as exc:
@@ -181,12 +248,7 @@ class TurnManager:
                         raise
                     from queue import Empty
                     if isinstance(exc, Empty):
-                        telemetry.mark('turn_completed_at')
-                        telemetry.set_stage('timed_out', status='timed_out', event='Turn timed out')
-                        result = TurnResult(thread_id, turn_id, 'timeout', ''.join(deltas.values()), started_at, int(time.time()), telemetry=telemetry)
-                        self.registry.finish(result)
-                        self._progress(on_progress, state='timed_out', thread_id=thread_id, turn_id=turn_id, steer_available=False, stage='timed_out')
-                        return result
+                        return self._timeout_result(thread_id, turn_id, deltas, started_at, telemetry, on_progress)
                     raise
                 method = message.get('method')
                 params = message.get('params', {})
@@ -237,6 +299,11 @@ class TurnManager:
                     self._progress(on_progress, state='running', thread_id=thread_id, turn_id=turn_id, steer_available=True, stage='planning')
                 elif method == 'thread/tokenUsage/updated':
                     telemetry.update_token_usage(params)
+                    usage = telemetry.snapshot()
+                    self._progress(
+                        on_progress,
+                        context_usage_percent=usage.get('context_usage_percent'),
+                    )
                 elif method == 'item/started':
                     item = params.get('item') or {}
                     item_type = item.get('type')
@@ -277,7 +344,9 @@ class TurnManager:
                     telemetry.set_stage(stage, status=stage, event=f'Turn {stage}', at=native_at)
             final_message = ''.join(deltas.values())
             if not final_message:
-                final_message = ''.join(self._message_from_item(item) for item in completed.get('items', []))
+                final_message = ''.join(self._message_from_item(item) for item in (completed.get('items') or []) if isinstance(item, dict))
+            native_error = completed.get('error') or {}
+            error_message = native_error.get('message') if isinstance(native_error, dict) else str(native_error)
             result = TurnResult(
                 thread_id,
                 turn_id,
@@ -285,7 +354,7 @@ class TurnManager:
                 final_message,
                 self._timestamp(completed.get('startedAt')) or started_at,
                 self._timestamp(completed.get('completedAt')) or int(time.time()),
-                (completed.get('error') or {}).get('message'),
+                error_message or None,
                 telemetry,
             )
             self.registry.finish(result)
@@ -298,9 +367,9 @@ class TurnManager:
             self._progress(on_progress, state=state, thread_id=thread_id, turn_id=turn_id, steer_available=False, stage=state)
             return result
         except Exception as exc:
+            telemetry.mark('turn_completed_at')
+            telemetry.set_stage('failed', status='failed', event='Turn failed')
             if turn_id and self.registry.get(thread_id):
-                telemetry.mark('turn_completed_at')
-                telemetry.set_stage('failed', status='failed', event='Turn failed')
                 result = TurnResult(
                     thread_id,
                     turn_id,
@@ -312,7 +381,9 @@ class TurnManager:
                     telemetry,
                 )
                 self.registry.finish(result)
-                self._progress(on_progress, state='failed', thread_id=thread_id, turn_id=turn_id, steer_available=False, stage='failed')
+            else:
+                self.registry.complete_telemetry(telemetry)
+            self._progress(on_progress, state='failed', thread_id=thread_id, turn_id=turn_id, steer_available=False, stage='failed')
             raise
         finally:
             subscription.close()

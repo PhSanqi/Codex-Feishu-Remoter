@@ -1,22 +1,21 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
+import uuid
 
 from .codex.app_server import AppServerClient
 from .codex.diagnostics import config_schema_snapshot, gate_metadata, inspect_runtime, normalize_gate_origin, safe_error
 from .codex.launcher import CodexLauncher
-from .codex.runtime_lease import CfrThreadRuntimeLeaseManager
 from .codex.threads import ThreadManager
 from .codex.turns import TurnManager
 from .config import resolve_cfr_codex_home
-from .network import proxy_child_env, resolve_proxy
-from .platform import codex_home_permissions, detect_platform_capabilities
+from .network import proxy_child_env, resolve_cfr_proxy
+from .platform import codex_home_permissions, detect_platform_capabilities, hidden_subprocess_kwargs
 
 
 PROTOCOL_SHA256 = '9f7d498cb510be38baa10422b46860b2a4599898affe2ae56cdc73460f90908b'
@@ -93,14 +92,18 @@ def run_doctor(project_root=None, database='cfr.sqlite3', timeout=60, live=False
     project_root = Path(project_root or Path.cwd())
     gate_origin = normalize_gate_origin(gate_origin)
     resolved_home = resolve_cfr_codex_home(codex_home)
-    process_env = {**os.environ, **(proxy_child_env(resolve_proxy()) or {})}
+    network_resolution = resolve_cfr_proxy()
+    process_env = {**os.environ, **(proxy_child_env(network_resolution) or {})}
     process_env['CODEX_HOME'] = str(resolved_home.path)
     runtime = inspect_runtime(project_root, process_env=process_env, timeout=min(timeout, 30), codex_home=resolved_home.path, codex_bin=codex_bin)
     home = codex_home_permissions(resolved_home.path)
     protocol_path = project_root / 'docs' / 'reference' / 'CFR_AND_BROKER_COEXISTENCE_ROUTING_CONTRACT_v1.2.md'
     protocol_hash = _hash_file(protocol_path)
     db_snapshot = _db_readonly_snapshot(database)
-    capabilities = detect_platform_capabilities(desktop_continuity_live_validated=True if gate_origin == 'host_manual' else None)
+    # Gate provenance is not runtime evidence. A host-manual Doctor invocation
+    # must not manufacture a successful Desktop continuity result when no
+    # Desktop continuity probe was actually executed.
+    capabilities = detect_platform_capabilities(desktop_continuity_live_validated=None)
     executable = runtime.get('CodexExecutable') or {'Path': None, 'Source': None, 'Kind': None}
     launcher = CodexLauncher(executable=codex_bin, environment=process_env)
     version = None
@@ -113,6 +116,8 @@ def run_doctor(project_root=None, database='cfr.sqlite3', timeout=60, live=False
             errors='replace',
             timeout=10,
             env=process_env,
+            check=False,
+            **hidden_subprocess_kwargs(),
         )
         version = (completed.stdout or completed.stderr).strip()
     except Exception:
@@ -137,7 +142,7 @@ def run_doctor(project_root=None, database='cfr.sqlite3', timeout=60, live=False
             'RolloutWatchSupported': capabilities.rollout_watch_supported,
             'DesktopContinuityLiveValidated': capabilities.desktop_continuity_live_validated,
         },
-        'CfrInstanceId': CfrThreadRuntimeLeaseManager(database).instance_id,
+        'CfrInstanceId': str(uuid.uuid4()),
         'CfrDatabase': db_snapshot,
         'ResolvedCfrCodexHome': str(resolved_home.path),
         'CodexHomeSource': resolved_home.source,
@@ -154,13 +159,23 @@ def run_doctor(project_root=None, database='cfr.sqlite3', timeout=60, live=False
             else 'UNKNOWN'
         ),
         'CodexInterfaceMissingRequiredMethods': interface.get('MissingRequiredMethods', []),
+        'CodexInboundServerRequestCompatibility': (
+            'PASS' if interface.get('InboundServerRequestsCompatible') is True
+            else 'FAIL' if interface.get('GeneratedSchema') is True
+            else 'UNKNOWN'
+        ),
+        'CodexInboundMissingRequiredServerRequests': interface.get('MissingRequiredServerRequests', []),
+        'CodexInboundUnaccountedServerRequests': interface.get('UnaccountedServerRequests', []),
+        'CodexInboundServerRequestMethods': interface.get('ServerRequestMethods', []),
+        'CodexInterfaceSchemaFingerprint': interface.get('SchemaFingerprint'),
         'CodexInterfaceSchema': interface,
         'LoginStatus': runtime.get('LoginStatus'),
         'AuthMode': runtime.get('AuthMode'),
         'PlanType': runtime.get('PlanType'),
         'RoutingConsistency': runtime.get('RoutingConsistency'),
         'NetworkBasic': 'NOT_RUN_READ_ONLY',
-        'SelectedNetworkMode': 'none',
+        'SelectedNetworkMode': network_resolution.mode,
+        'SelectedNetworkSource': network_resolution.source,
         'AppServerInitialize': 'PASS' if runtime.get('AccountReadSucceeded') or runtime.get('ConfigReadSucceeded') else 'FAIL',
         'RuntimeLeaseSchema': db_snapshot.get('RuntimeLeaseSchema'),
         'RuntimeLeaseHealth': 'WARN_NON_DURABLE_DATABASE' if db_snapshot.get('RuntimeLeaseSchema') == 'NON_DURABLE_MEMORY' else ('PASS' if db_snapshot.get('RuntimeLeaseSchema') in ('PASS', 'NOT_PRESENT') else 'FAIL'),

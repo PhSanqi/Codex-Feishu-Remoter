@@ -11,6 +11,7 @@ from cfr.feishu.sdk_compat import (
     _loop_tasks,
     _sdk_owned_task,
     capture_channel_sdk_shutdown_targets,
+    close_idle_channel_sdk_loop,
     drain_bg_loop_before_sdk_stop,
     drain_captured_bg_loop_after_worker,
     drain_dedicated_channel_bg_loop,
@@ -34,6 +35,24 @@ def _sdk_module():
 
 
 class SdkTaskOwnershipTests(unittest.TestCase):
+    def test_idle_import_loop_closes_only_without_pending_tasks(self):
+        module = ModuleType('lark_channel.test_loop')
+        loop = asyncio.new_event_loop()
+        module.loop = loop
+        self.assertTrue(close_idle_channel_sdk_loop(module))
+        self.assertTrue(loop.is_closed())
+
+        module.loop = asyncio.new_event_loop()
+        event = asyncio.Event()
+        task = module.loop.create_task(_sdk_module().fake_sdk_ping(event))
+        try:
+            self.assertFalse(close_idle_channel_sdk_loop(module))
+            self.assertFalse(module.loop.is_closed())
+        finally:
+            task.cancel()
+            module.loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+            module.loop.close()
+
     def test_sdk_owned_task_detects_real_coroutine_module_via_cr_frame(self):
         loop = asyncio.new_event_loop()
         module = _sdk_module()

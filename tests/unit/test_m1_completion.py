@@ -13,10 +13,11 @@ from cfr.codex.app_server import AppServerRpcError, NotificationDispatcher
 from cfr.codex.binding import CodexAdapter
 from cfr.codex.lease import LeaseState, WriterLeaseManager
 from cfr.codex.rollout import RolloutWatcher, canonical_path_key
-from cfr.codex.turns import TurnManager
+from cfr.codex.threads import ThreadManager
+from cfr.codex.turns import ActiveTurnRegistry, RECENT_TURN_LIMIT, TurnManager
 from cfr.core.events import CfrEvent, EventSource
 from cfr.core.projector import EventProjector
-from cfr.core.models import StructuredError
+from cfr.core.models import ActiveTurn, StructuredError, ThreadRef, TurnResult
 from cfr.storage.db import BindingStore
 
 
@@ -60,6 +61,43 @@ class ActiveWriterClient(FakeClient):
         return super().request(method, params, timeout)
 
 
+class ArchivedThreadClient:
+    def __init__(self):
+        self.calls = []
+        self.archived = True
+
+    def request(self, method, params, timeout=None):
+        self.calls.append((method, dict(params)))
+        if method == 'thread/resume' and self.archived:
+            raise AppServerRpcError(method, -32600, 'session thread-archived is archived. Run codex unarchive first.')
+        if method == 'thread/unarchive':
+            self.archived = False
+            return {'thread': {'id': params['threadId']}}
+        if method == 'thread/resume':
+            return {'thread': {'id': params['threadId']}}
+        raise AssertionError(method)
+
+
+class ThreadStartCaptureClient:
+    def __init__(self):
+        self.params = None
+
+    def request(self, method, params, timeout=None):
+        if method != 'thread/start':
+            raise AssertionError(method)
+        self.params = dict(params)
+        return {'thread': {'id': 'thread-settings', 'cwd': params['cwd']}}
+
+
+class AttachmentClient(FakeClient):
+    last_turn_input = None
+
+    def request(self, method, params, timeout=None):
+        if method == 'turn/start':
+            type(self).last_turn_input = list(params.get('input') or [])
+        return super().request(method, params, timeout)
+
+
 class BlockingClient(FakeClient):
     def request(self, method, params, timeout=None):
         if method in ('thread/resume',):
@@ -90,6 +128,145 @@ class ExplodingClient(FakeClient):
 
 
 class M1CompletionTests(unittest.TestCase):
+    def test_bound_archived_thread_is_unarchived_once_then_resumed(self):
+        client = ArchivedThreadClient()
+        manager = ThreadManager(client)
+        result = CodexAdapter._resume_bound_thread(manager, 'thread-archived', settings={'approval_policy': 'on-request'})
+        self.assertEqual(result['thread']['id'], 'thread-archived')
+        self.assertEqual([method for method, _params in client.calls], [
+            'thread/resume', 'thread/unarchive', 'thread/resume',
+        ])
+        self.assertEqual(client.calls[-1][1]['approvalPolicy'], 'on-request')
+
+    def test_binding_store_initializes_file_schema_once_and_enables_wal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bindings.sqlite3'
+            original = BindingStore._initialize
+            calls = []
+
+            def counted(store):
+                calls.append(store.db_path)
+                return original(store)
+
+            with patch.object(BindingStore, '_initialize', counted):
+                BindingStore(path)
+                BindingStore(path)
+            self.assertEqual(calls, [path])
+            import sqlite3
+            connection = sqlite3.connect(path)
+            try:
+                self.assertEqual(connection.execute('pragma journal_mode').fetchone()[0], 'wal')
+                indexes = {row[0] for row in connection.execute(
+                    "select name from sqlite_master where type='index' and name like 'idx_%'"
+                )}
+            finally:
+                connection.close()
+            self.assertIn('idx_codex_bindings_updated', indexes)
+
+    def test_active_turn_registry_does_not_return_previous_turn_and_bounds_waiters(self):
+        registry = ActiveTurnRegistry()
+        registry.finish(TurnResult('thread-repeat', 'turn-old', 'completed'))
+        registry.register(ActiveTurn('thread-repeat', 'turn-new', object()))
+        self.assertIsNone(registry.wait('thread-repeat', timeout=0))
+        registry.finish(TurnResult('thread-repeat', 'turn-new', 'completed'))
+        self.assertEqual(registry.wait('thread-repeat', timeout=0).turn_id, 'turn-new')
+        for index in range(RECENT_TURN_LIMIT + 5):
+            registry.register(ActiveTurn(f'thread-{index}', f'turn-{index}', object()))
+            registry.finish(TurnResult(f'thread-{index}', f'turn-{index}', 'completed'))
+        self.assertLessEqual(len(registry._done), RECENT_TURN_LIMIT)
+
+    def test_event_dedupe_retention_keeps_only_newest_rows_inside_age_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = BindingStore(Path(directory) / 'bindings.sqlite3')
+            with store._connection() as connection:
+                connection.executemany(
+                    'insert into event_dedupe(event_key,created_at) values(?,?)',
+                    [(f'old-{index}', 100.0 + index) for index in range(3)]
+                    + [(f'new-{index}', 900.0 + index) for index in range(10)],
+                )
+            result = store.prune_event_dedupe(max_rows=5, max_age_seconds=200, now=1000)
+            with store._connection() as connection:
+                rows = connection.execute(
+                    'select event_key from event_dedupe order by created_at,event_key'
+                ).fetchall()
+            self.assertEqual(result, {'before': 13, 'after': 5, 'deleted': 8})
+            self.assertEqual([row[0] for row in rows], [f'new-{index}' for index in range(5, 10)])
+
+    def test_binding_list_limit_is_applied_by_sql_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = BindingStore(Path(directory) / 'bindings.sqlite3')
+            for index in range(5):
+                store.upsert_binding(ThreadRef(f'thread-{index}', None, Path(directory)))
+                with store._connection() as connection:
+                    connection.execute(
+                        'update codex_bindings set updated_at=? where thread_id=?',
+                        (float(index), f'thread-{index}'),
+                    )
+            self.assertEqual(
+                [item.thread_id for item in store.list_bindings(limit=2)],
+                ['thread-4', 'thread-3'],
+            )
+
+    def test_thread_start_accepts_pending_model_reasoning_and_tier_without_post_start_mutation(self):
+        client = ThreadStartCaptureClient()
+        manager = ThreadManager(client)
+        manager.create_thread(
+            Path('C:/workspace'),
+            settings={'model': 'gpt-5.6-sol', 'reasoning_effort': 'medium', 'service_tier': 'priority'},
+        )
+        self.assertEqual(client.params['model'], 'gpt-5.6-sol')
+        self.assertEqual(client.params['config'], {'model_reasoning_effort': 'medium'})
+        self.assertEqual(client.params['serviceTier'], 'priority')
+
+    def test_thread_start_and_resume_accept_native_permission_profile_fields(self):
+        client = ThreadStartCaptureClient()
+        manager = ThreadManager(client)
+        manager.create_thread(Path('C:/workspace'), settings={
+            'approval_policy': 'on-request',
+            'approvals_reviewer': 'auto_review',
+            'sandbox': 'workspace-write',
+        })
+        self.assertEqual(client.params['approvalPolicy'], 'on-request')
+        self.assertEqual(client.params['approvalsReviewer'], 'auto_review')
+        self.assertEqual(client.params['sandbox'], 'workspace-write')
+
+        class ResumeClient:
+            def __init__(self): self.params = None
+            def request(self, method, params, timeout=None):
+                self.assert_method = method
+                self.params = dict(params)
+                return {'thread': {'id': params['threadId'], 'cwd': 'C:/workspace'}}
+
+        resume_client = ResumeClient()
+        ThreadManager(resume_client).resume_thread('thread-1', settings={
+            'approval_policy': 'never',
+            'sandbox': 'danger-full-access',
+        })
+        self.assertEqual(resume_client.assert_method, 'thread/resume')
+        self.assertEqual(resume_client.params['approvalPolicy'], 'never')
+        self.assertEqual(resume_client.params['sandbox'], 'danger-full-access')
+        self.assertNotIn('approvalsReviewer', resume_client.params)
+
+    def test_turn_start_accepts_native_image_and_connector_mentions(self):
+        class Client:
+            def __init__(self): self.calls = []
+            def request(self, method, params):
+                self.calls.append((method, params))
+                return {'turn': {'id': 'turn-1'}}
+
+        client = Client()
+        manager = TurnManager(client)
+        manager.start_turn('thread-1', 'inspect attachments', [
+            {'type': 'localImage', 'path': r'C:\tmp\diagram.png'},
+            {'type': 'mention', 'name': 'GitHub', 'path': 'app://github'},
+        ])
+        self.assertEqual(client.calls[0][0], 'turn/start')
+        self.assertEqual(client.calls[0][1]['input'], [
+            {'type': 'text', 'text': 'inspect attachments'},
+            {'type': 'localImage', 'path': r'C:\tmp\diagram.png'},
+            {'type': 'mention', 'name': 'GitHub', 'path': 'app://github'},
+        ])
+
     def test_binding_migration_and_cursor_preservation(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / 'cfr.sqlite3'
@@ -182,6 +359,28 @@ class M1CompletionTests(unittest.TestCase):
             self.assertEqual(result.status, 'completed')
             self.assertEqual(binding.desktop_sync_state, 'refresh_required')
             self.assertEqual(binding.writer_state, 'idle')
+            store.close()
+
+    def test_send_passes_native_attachments_through_adapter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rollout = Path(directory) / 'rollout.jsonl'
+            rollout.write_text('', encoding='utf-8')
+            image = Path(directory) / 'diagram.png'
+            image.write_bytes(b'png')
+            AttachmentClient.rollout_path = rollout
+            AttachmentClient.last_turn_input = None
+            store = BindingStore(Path(directory) / 'cfr.sqlite3')
+            ref = type('Ref', (), {'thread_id': 'thread-1', 'name': 'name', 'cwd': Path(directory), 'rollout_path': rollout})()
+            store.upsert_binding(ref)
+            with patch('cfr.codex.binding.AppServerClient', AttachmentClient):
+                result = asyncio.run(CodexAdapter(store=store).send_message('thread-1', 'inspect', attachments=[
+                    {'type': 'localImage', 'path': str(image)},
+                    {'type': 'mention', 'name': 'GitHub', 'path': 'app://github'},
+                ]))
+            self.assertEqual(result.status, 'completed')
+            self.assertEqual(AttachmentClient.last_turn_input[0], {'type': 'text', 'text': 'inspect'})
+            self.assertEqual(AttachmentClient.last_turn_input[1]['type'], 'localImage')
+            self.assertEqual(AttachmentClient.last_turn_input[2]['type'], 'mention')
             store.close()
 
     def test_active_writer_maps_to_structured_error_and_recovers(self):
@@ -487,6 +686,8 @@ class M1CompletionTests(unittest.TestCase):
         leases.acquire('b')
         self.assertEqual(leases.state_for('a'), LeaseState.CFR_ACTIVE)
         self.assertEqual(leases.state_for('b'), LeaseState.CFR_ACTIVE)
+        leases.release('a')
+        self.assertNotIn('a', leases._states)
 
     def test_rollout_explicit_thread_and_partial_utf8_line(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -607,6 +808,77 @@ class M1CompletionTests(unittest.TestCase):
             self.assertEqual(stop['status'], 'STOP_REQUESTED')
             self.assertEqual(result.status, 'interrupted')
             store.close()
+
+    def test_active_turn_and_writer_are_durably_visible_while_turn_runs(self):
+        async def scenario(adapter, store):
+            task = asyncio.create_task(adapter.send_message('thread-1', 'long'))
+            for _ in range(200):
+                binding = store.get_binding('thread-1')
+                if binding.active_turn_id == 'turn-1':
+                    break
+                await asyncio.sleep(0.01)
+            observed = store.get_binding('thread-1')
+            stop = await adapter.stop('thread-1')
+            result = await task
+            return observed, stop, result
+
+        with tempfile.TemporaryDirectory() as directory:
+            rollout = Path(directory) / 'rollout.jsonl'
+            rollout.write_text('', encoding='utf-8')
+            BlockingClient.rollout_path = rollout
+            store = BindingStore(Path(directory) / 'cfr.sqlite3')
+            store.upsert_binding(type('Ref', (), {
+                'thread_id': 'thread-1', 'name': 'name', 'cwd': Path(directory), 'rollout_path': rollout,
+            })())
+            with patch('cfr.codex.binding.AppServerClient', BlockingClient):
+                observed, stop, result = asyncio.run(scenario(CodexAdapter(store=store, timeout=2), store))
+            self.assertEqual(observed.writer_state, 'cfr_active')
+            self.assertEqual(observed.active_turn_id, 'turn-1')
+            self.assertEqual(stop['status'], 'STOP_REQUESTED')
+            self.assertEqual(result.status, 'interrupted')
+            self.assertEqual(store.get_binding('thread-1').writer_state, 'idle')
+            store.close()
+
+    def test_send_cleanup_failure_still_releases_all_runtime_leases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rollout = Path(directory) / 'rollout.jsonl'
+            rollout.write_text('', encoding='utf-8')
+            FakeClient.rollout_path = rollout
+            store = BindingStore(Path(directory) / 'cfr.sqlite3')
+            store.upsert_binding(type('Ref', (), {
+                'thread_id': 'thread-1', 'name': 'name', 'cwd': Path(directory), 'rollout_path': rollout,
+            })())
+            adapter = CodexAdapter(store=store)
+            with patch('cfr.codex.binding.AppServerClient', FakeClient), patch.object(
+                store, 'clear_active_turn', side_effect=OSError('projection cleanup failed')
+            ), self.assertRaisesRegex(OSError, 'projection cleanup failed'):
+                asyncio.run(adapter.send_message('thread-1', 'hello'))
+            self.assertEqual(adapter.leases.state_for('thread-1'), LeaseState.IDLE)
+            self.assertEqual(adapter.runtime_leases.inspect(), [])
+            store.close()
+
+    def test_create_primary_failure_is_not_masked_by_client_close_failure(self):
+        class StartAndCloseFailureClient(FakeClient):
+            def request(self, method, params, timeout=None):
+                if method == 'turn/start':
+                    raise RuntimeError('turn start failed')
+                return super().request(method, params, timeout)
+
+            def close(self):
+                raise RuntimeError('close failed')
+
+        with tempfile.TemporaryDirectory() as directory:
+            rollout = Path(directory) / 'rollout.jsonl'
+            rollout.write_text('', encoding='utf-8')
+            StartAndCloseFailureClient.rollout_path = rollout
+            adapter = CodexAdapter()
+            with patch('cfr.codex.binding.AppServerClient', StartAndCloseFailureClient), self.assertRaisesRegex(
+                RuntimeError, 'turn start failed'
+            ):
+                asyncio.run(adapter.create_conversation(Path(directory), 'name', 'hello'))
+            telemetry = adapter.registry.telemetry_snapshots()[0]
+            self.assertEqual(telemetry['status'], 'failed')
+            self.assertIsNotNone(telemetry['metrics']['cleanup_ms'])
 
 
 if __name__ == '__main__':

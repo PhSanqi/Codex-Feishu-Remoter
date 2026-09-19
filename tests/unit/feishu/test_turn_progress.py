@@ -10,7 +10,7 @@ from cfr.codex.turns import TurnManager
 from cfr.core.models import TurnResult
 from cfr.feishu.daemon import FeishuDaemon
 from cfr.feishu.models import FeishuInboundMessage
-from cfr.feishu.progress import FeishuTurnProgress, MAX_OUTPUT_PREVIEW_CHARS, MAX_OUTPUT_PREVIEW_LINE_CHARS, MAX_OUTPUT_PREVIEW_LINES, MAX_REASONING_PREVIEW_CHARS, MAX_REASONING_PREVIEW_LINE_CHARS, MAX_REASONING_PREVIEW_LINES
+from cfr.feishu.progress import FeishuChatProgress, FeishuTurnProgress, MAX_OUTPUT_PREVIEW_CHARS, MAX_OUTPUT_PREVIEW_LINE_CHARS, MAX_OUTPUT_PREVIEW_LINES, MAX_REASONING_PREVIEW_CHARS, MAX_REASONING_PREVIEW_LINE_CHARS, MAX_REASONING_PREVIEW_LINES
 
 
 class _Clock:
@@ -43,7 +43,7 @@ class _TurnClient:
         self.subscription = subscription
         self.requests = []
 
-    def request(self, method, params):
+    def request(self, method, params, timeout=None):
         self.requests.append((method, params))
         if method == 'turn/start':
             return {'turn': {'id': 'turn-1'}}
@@ -158,6 +158,7 @@ class TurnTimeoutAndProgressTests(unittest.TestCase):
             result = manager.run_turn('thread-1', '任务', turn_timeout=1800)
         self.assertEqual(result.status, 'timeout')
         self.assertIsNone(manager.registry.get('thread-1'))
+        self.assertIn('turn/interrupt', [method for method, _ in client.requests])
 
     def test_progress_card_coalesces_updates_and_does_not_leak_raw_reasoning(self):
         clock = _Clock()
@@ -177,16 +178,39 @@ class TurnTimeoutAndProgressTests(unittest.TestCase):
         self.assertIn('已完成', rendered)
         self.assertNotIn('RAW_REASONING_MUST_NOT_LEAK', rendered)
 
+    def test_chat_progress_card_streams_only_supplied_visible_web_text(self):
+        replies = _ProgressReplies()
+        progress = FeishuChatProgress(replies, 'message-chat', 'user-1', interval=0.01)
+        progress.start()
+        progress.on_progress({
+            'state': 'generating',
+            'reasoning_text': '网页上实际显示的分析文字',
+            'answer_preview': '网页回复片段',
+        })
+        time.sleep(0.02)
+        progress.finish('completed')
+        progress.wait()
+        rendered = replies.updates[-1][1]['body']['elements'][0]['content']
+        self.assertIn('网页上实际显示的分析文字', rendered)
+        self.assertIn('网页回复片段', rendered)
+        self.assertIn('已完成', rendered)
+
     def test_progress_worker_heartbeats_without_codex_events_and_terminates(self):
         clock = _Clock()
         replies = _ProgressReplies()
-        progress = FeishuTurnProgress(replies, 'message-1', 'user-1', clock=clock.monotonic, interval=0.01)
+        progress = FeishuTurnProgress(replies, 'message-1', 'user-1', clock=clock.monotonic, interval=0.01, heartbeat=0.5)
         progress.start()
-        time.sleep(0.02)
+        deadline = time.monotonic() + 0.5
+        while len(replies.updates) < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
         clock.value = 1
-        time.sleep(0.02)
+        deadline = time.monotonic() + 0.5
+        while len(replies.updates) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
         clock.value = 2
-        time.sleep(0.02)
+        deadline = time.monotonic() + 0.5
+        while len(replies.updates) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
         progress.finish('completed')
         progress.wait()
         elapsed = [update[1]['body']['elements'][0]['content'].split(' · ', 2)[1].removesuffix('s') for update in replies.updates]
@@ -194,10 +218,34 @@ class TurnTimeoutAndProgressTests(unittest.TestCase):
         self.assertGreater(int(elapsed[-1]), int(elapsed[0]))
         self.assertFalse(progress._worker.is_alive())
 
+    def test_chat_progress_clock_heartbeats_without_new_web_text(self):
+        clock = _Clock()
+        replies = _ProgressReplies()
+        progress = FeishuChatProgress(replies, 'message-chat', 'user-1', clock=clock.monotonic, interval=0.01, heartbeat=0.5)
+        progress.start()
+        progress.on_progress({'state': 'generating', 'answer_preview': 'same preview'})
+        deadline = time.monotonic() + 0.5
+        while len(replies.updates) < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        clock.value = 1
+        deadline = time.monotonic() + 0.5
+        while len(replies.updates) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        clock.value = 2
+        deadline = time.monotonic() + 0.5
+        while len(replies.updates) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        progress.finish('completed')
+        progress.wait()
+        rendered = [update[1]['body']['elements'][0]['content'] for update in replies.updates]
+        self.assertGreaterEqual(len(rendered), 3)
+        self.assertTrue(any('2s' in value for value in rendered))
+
     def test_slow_update_keeps_latest_state_and_never_updates_concurrently(self):
         replies = _BlockingProgressReplies()
         progress = FeishuTurnProgress(replies, 'message-1', 'user-1', interval=0.01)
         progress.start()
+        progress.on_progress({'stage': 'running'})
         self.assertTrue(replies.entered.wait(0.5))
         progress.on_progress({'answer_preview': 'old'})
         progress.on_progress({'answer_preview': 'newest', 'reasoning_summary': 'latest summary'})
@@ -389,8 +437,10 @@ class FeishuFinalReplyTests(unittest.TestCase):
         daemon = FeishuDaemon.__new__(FeishuDaemon)
         daemon.replies = _DaemonReplies()
         daemon.adapter = _DaemonAdapter(result)
+        workspace = Path.cwd().resolve()
+        daemon.settings = SimpleNamespace(allowed_workspace_roots=(workspace,))
         daemon.store = SimpleNamespace(get_session=lambda _chat: SimpleNamespace(state='bound', thread_id='thread-1', pending_cwd=None))
-        daemon.binding_store = SimpleNamespace(get_binding=lambda _thread: SimpleNamespace(cwd=Path('workspace')))
+        daemon.binding_store = SimpleNamespace(get_binding=lambda _thread: SimpleNamespace(cwd=workspace))
         daemon.approvals = SimpleNamespace(finalize_feedback_for_turn=lambda **_kwargs: None)
         return daemon
 

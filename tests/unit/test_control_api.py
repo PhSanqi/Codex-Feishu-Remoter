@@ -4,13 +4,13 @@ import json
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 from urllib.error import HTTPError
 from urllib.parse import quote
 
-from cfr.control.api import LocalControlServer
-from cfr.control.supervisor import CfrSupervisor
+from cfr.control.api import LocalControlServer, MAX_CONTROL_REQUEST_BYTES
+from cfr.control.supervisor import CfrSupervisor, ControlCommandResult
 from cfr.core.models import ActiveTurn, ThreadRef, TurnResult
 from cfr.feishu.models import FeishuInboundMessage
 from cfr.feishu.store import FeishuStore
@@ -61,7 +61,8 @@ class _Transport:
 
 
 class _Daemon:
-    def __init__(self, _settings, transport):
+    def __init__(self, settings, transport):
+        self.settings = settings
         self.transport = transport
         self.store = object()
         self._started = False
@@ -72,6 +73,10 @@ class _Daemon:
     def stop(self):
         self._started = False
         self.transport.is_running = False
+
+    def update_workspace_roots(self, roots):
+        self.settings.allowed_workspace_roots = tuple(Path(root).resolve() for root in roots)
+        return self.settings
 
 
 class _Gateway:
@@ -122,6 +127,8 @@ class LocalControlApiTests(unittest.TestCase):
     def test_local_api_reads_state_and_controls_real_supervisor(self):
         self.assertIn('<div id="root">', self.index)
         self.assertEqual(self._request('/api/v1/status')['status'], 'ok')
+        operational = self._request('/api/v1/operational')['current_state']
+        self.assertEqual(set(operational), {'feishu', 'sessions', 'bindings', 'jobs', 'surfaces', 'activity', 'storage'})
         self.assertEqual(self._request('/api/v1/feishu/start', {})['status'], 'ok')
         self.assertEqual(self._request('/api/v1/feishu/stop', {})['status'], 'ok')
         self.assertEqual(self._request('/api/v1/feishu/reconnect', {})['status'], 'ok')
@@ -137,6 +144,54 @@ class LocalControlApiTests(unittest.TestCase):
         self.assertEqual((response['status'], response['message']), ('ok', 'Feishu activity'))
         self.assertEqual(response['current_state'][-1]['event'], 'FEISHU_STARTING')
         self.assertIsNone(self.supervisor._daemon)
+
+    def test_chat_surface_selection_explicitly_starts_browser_bridge(self):
+        class ChatAdapter:
+            def __init__(self):
+                self.started = 0
+
+            def health_snapshot(self):
+                return {
+                    'available': self.started > 0,
+                    'status': 'ready' if self.started else 'not_connected',
+                    'description': 'test chat',
+                }
+
+            def start(self):
+                self.started += 1
+                return self.health_snapshot()
+
+            def close(self):
+                pass
+
+        chat = ChatAdapter()
+        self.supervisor._chat_adapter = chat
+        FeishuStore(self.supervisor.database).set_selected_surface('chat-1', 'code')
+        result = self._request('/api/v1/surfaces/select', {'surface': 'chat'})
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(chat.started, 1)
+        self.assertEqual(FeishuStore(self.supervisor.database).get_selected_surface('chat-1'), 'chat')
+
+    def test_feishu_poll_uses_lightweight_projection_not_full_status_build(self):
+        with patch.object(self.server.read_model, 'build', side_effect=AssertionError('full status build')):
+            response = self._request('/api/v1/feishu')
+        self.assertEqual(response['status'], 'ok')
+        self.assertEqual(response['current_state']['state'], 'stopped')
+
+    def test_control_api_rejects_oversized_request_before_reading_json_body(self):
+        csrf = next(cookie.value for cookie in self.jar if cookie.name == 'cfr_control_csrf')
+        request = Request(
+            f'{self.server.url}/api/v1/runtime/remote-execution',
+            data=b'{' + b' ' * MAX_CONTROL_REQUEST_BYTES,
+            headers={'X-CFR-CSRF': csrf, 'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with self.assertRaises(HTTPError) as raised:
+            self.opener.open(request)
+        self.assertEqual(raised.exception.code, 400)
+        payload = json.loads(raised.exception.read())
+        self.assertEqual(payload['error_code'], 'CONTROL_INVALID_REQUEST')
+        raised.exception.close()
 
     def test_localhost_smoke_applies_admission_policy_and_lifecycle(self):
         self.assertEqual(self._request('/api/v1/status')['status'], 'ok')
@@ -202,8 +257,81 @@ class LocalControlApiTests(unittest.TestCase):
             first = self._request(path, {'uri': 'codex://threads/new?path=C:/wrong'})
             second = self._request(path, method='POST')
         self.assertEqual((first['status'], second['status']), ('ok', 'ok'))
-        self.assertEqual(launch.call_args_list, [call('thread/registered'), call('thread/registered')])
+        self.assertEqual(launch.call_args_list, [call('thread/registered', launcher='auto'), call('thread/registered', launcher='auto')])
         self.assertEqual(bindings.get_binding('thread/registered'), before)
+
+    def test_setup_preferences_persist_browser_and_codexhost_launcher(self):
+        result = self._request('/api/v1/setup/preferences', {
+            'default_surface': 'chat',
+            'network_mode': 'direct',
+            'proxy_url': None,
+            'chat_browser_backend': 'embedded',
+            'codex_desktop_launcher': 'codexhost',
+        })
+        self.assertEqual(result['status'], 'ok')
+        config = self.supervisor._config_store
+        self.assertEqual(config.get_chat_browser_backend(), 'embedded')
+        self.assertEqual(config.get_codex_desktop_launcher(), 'codexhost')
+
+    def test_show_embedded_chat_endpoint_only_reveals_login_flow(self):
+        host = SimpleNamespace(available=True, show=Mock())
+        self.supervisor.attach_embedded_chat_host(host)
+        hidden = self._request('/api/v1/setup/chat/show', method='POST')
+        self.assertEqual(hidden['error_code'], 'CONTROL_CHAT_AUTOMATION_HIDDEN')
+        self.supervisor._chat_adapter = SimpleNamespace(health_snapshot=lambda: {'status': 'waiting_user'})
+        result = self._request('/api/v1/setup/chat/show', method='POST')
+        self.assertEqual(result['status'], 'ok')
+        host.show.assert_called_once_with()
+
+    def test_manual_chat_login_endpoints_are_exposed(self):
+        started = ControlCommandResult('ok', None, 'manual started', {})
+        verified = ControlCommandResult('ok', None, 'manual verified', {})
+        with patch.object(self.supervisor, 'start_manual_chat_login', return_value=started) as start, patch.object(
+            self.supervisor, 'finish_manual_chat_login', return_value=verified
+        ) as verify:
+            start_result = self._request('/api/v1/setup/chat/manual-login/start', method='POST')
+            verify_result = self._request('/api/v1/setup/chat/manual-login/verify', method='POST')
+        self.assertEqual(start_result['message'], 'manual started')
+        self.assertEqual(verify_result['message'], 'manual verified')
+        start.assert_called_once_with()
+        verify.assert_called_once_with()
+
+    def test_open_desktop_restart_is_explicit_and_uses_scoped_restart_handoff(self):
+        bindings = BindingStore(self.supervisor.database)
+        bindings.upsert_binding(ThreadRef('thread-restart', 'native thread', Path(self.directory.name)))
+        path = '/api/v1/threads/thread-restart/open-desktop'
+        with patch('cfr.control.api.restart_codex_desktop_thread', return_value='codex://threads/thread-restart') as restart, patch('cfr.control.api.open_codex_desktop_thread') as launch:
+            response = self._request(path, {'restart': True})
+        self.assertEqual(response['status'], 'ok')
+        restart.assert_called_once_with('thread-restart', launcher='auto')
+        launch.assert_not_called()
+
+    def test_desktop_restart_is_blocked_by_other_busy_cfr_binding_but_plain_open_is_not(self):
+        bindings = BindingStore(self.supervisor.database)
+        bindings.upsert_binding(ThreadRef('thread-target', 'target', Path(self.directory.name)))
+        bindings.upsert_binding(ThreadRef('thread-other', 'other', Path(self.directory.name)))
+        bindings.set_writer_state('thread-other', 'external_active')
+        path = '/api/v1/threads/thread-target/open-desktop'
+        with patch('cfr.control.api.restart_codex_desktop_thread') as restart, patch(
+            'cfr.control.api.open_codex_desktop_thread', return_value='codex://threads/thread-target'
+        ) as launch:
+            blocked = self._request(path, {'restart': True})
+            opened = self._request(path, method='POST')
+        self.assertEqual(blocked['error_code'], 'CONTROL_DESKTOP_RESTART_BUSY')
+        self.assertEqual(opened['status'], 'ok')
+        restart.assert_not_called()
+        launch.assert_called_once_with('thread-target', launcher='auto')
+
+    def test_desktop_restart_is_blocked_by_live_registry_state_not_yet_persisted(self):
+        bindings = BindingStore(self.supervisor.database)
+        bindings.upsert_binding(ThreadRef('thread-target-live', 'target', Path(self.directory.name)))
+        adapter = CodexAdapter(store=bindings)
+        self.supervisor._daemon = SimpleNamespace(adapter=adapter)
+        adapter.registry.register(ActiveTurn('thread-other-live', 'turn-live', object()))
+        with patch('cfr.control.api.restart_codex_desktop_thread') as restart:
+            blocked = self._request('/api/v1/threads/thread-target-live/open-desktop', {'restart': True})
+        self.assertEqual(blocked['error_code'], 'CONTROL_DESKTOP_RESTART_BUSY')
+        restart.assert_not_called()
 
     def test_open_desktop_rejects_real_live_registry_and_writer_when_binding_is_idle(self):
         bindings = BindingStore(self.supervisor.database)
@@ -245,15 +373,23 @@ class LocalControlApiTests(unittest.TestCase):
         self.assertEqual(unsupported['error_code'], 'CODEX_DESKTOP_OPEN_UNSUPPORTED')
         self.assertEqual(failed['error_code'], 'CODEX_DESKTOP_OPEN_FAILED')
 
-    def test_control_center_source_polls_jobs_and_sessions_only_while_feishu_runs(self):
+    def test_control_center_source_uses_one_serial_operational_poll(self):
         source = (ROOT / 'm3_control' / 'src' / 'main.tsx').read_text(encoding='utf-8')
-        self.assertIn("if (!model?.feishu.running) return", source)
-        self.assertIn("api<{ current_state: Session[] }>('/api/v1/sessions')", source)
-        self.assertIn("api<{ current_state: Job[] }>('/api/v1/jobs')", source)
-        self.assertIn('setInterval(refreshOperationalState, 1200)', source)
+        self.assertIn("api<{ current_state: Operational }>('/api/v1/operational')", source)
+        self.assertIn('function pollSerially', source)
+        self.assertIn('onError?: (error: unknown) => void', source)
+        self.assertIn('window.setTimeout(run, intervalMs)', source)
+        self.assertIn('model?.feishu.running ? 1200 : 3000', source)
+        self.assertIn('控制 API 连接中断；控制中心正在自动重试。', source)
+        self.assertIn('控制 API 已恢复连接。', source)
+        self.assertNotIn('setInterval(refreshOperationalState', source)
         self.assertIn('当前飞书绑定', source)
-        self.assertIn('可用 CFR 会话', source)
-        operational_poll = source.split('const refreshOperationalState = ', 1)[1].split('const timer', 1)[0]
+        self.assertIn('可用 CFR 会话 / 持久化 Codex 线程', source)
+        operational_poll = source.split('const refreshOperationalState = ', 1)[1].split('return pollSerially', 1)[0]
+        self.assertNotIn('/api/v1/sessions', operational_poll)
+        self.assertNotIn('/api/v1/jobs', operational_poll)
+        self.assertNotIn('/api/v1/bindings', operational_poll)
+        self.assertNotIn('/api/v1/surfaces', operational_poll)
         self.assertNotIn('/api/v1/models', operational_poll)
         self.assertNotIn('/api/v1/settings', operational_poll)
         self.assertNotIn('/api/v1/capabilities', operational_poll)
@@ -265,7 +401,7 @@ class LocalControlApiTests(unittest.TestCase):
         desktop_action = source.split('const openDesktop = ', 1)[1].split('const copyPairingMessage', 1)[0]
         self.assertNotIn('refresh()', desktop_action)
         self.assertIn("jobs.some((job) => job.active && job.thread_id === binding.thread_id)", source)
-        self.assertIn('Codex Runtime', source)
+        self.assertIn('CFR Runtime', source)
         self.assertIn('Runtime breakdown', source)
         self.assertIn('Tokens and context', source)
         self.assertIn('Tool activity', source)
@@ -295,8 +431,8 @@ class LocalControlApiTests(unittest.TestCase):
         self.assertEqual(response['status'], 'ok')
         self.assertEqual(response['current_state'][0]['feedback_state'], 'EXECUTION_FAILED')
 
-    def test_models_and_capabilities_api_require_control_auth(self):
-        for path in ('/api/v1/models', '/api/v1/capabilities'):
+    def test_models_capabilities_and_surfaces_api_require_control_auth(self):
+        for path in ('/api/v1/models', '/api/v1/capabilities', '/api/v1/surfaces'):
             with self.assertRaises(HTTPError) as raised:
                 build_opener().open(f'{self.server.url}{path}')
             self.assertEqual(raised.exception.code, 403)
@@ -307,6 +443,41 @@ class LocalControlApiTests(unittest.TestCase):
         self.server.read_model.capabilities = lambda: {'context': 'default', 'permission_profiles': {'available': True, 'data': []}, 'experimental_features': {'available': True, 'data': []}}
         self.assertEqual(self._request('/api/v1/models')['current_state']['data'][0]['id'], 'runtime')
         self.assertEqual(self._request('/api/v1/capabilities')['current_state']['context'], 'default')
+
+    def test_surfaces_api_defaults_to_code_without_remote_chat_state(self):
+        response = self._request('/api/v1/surfaces')['current_state']
+        self.assertEqual(response['selected'], 'code')
+        states = {item['id']: item['available'] for item in response['data']}
+        self.assertEqual(states, {'chat': False, 'work': False, 'code': True})
+
+    def test_surfaces_api_reads_and_writes_most_recent_feishu_chat_selection(self):
+        class ChatAdapter:
+            def health(self):
+                return {'available': True, 'status': 'ready', 'description': 'test chat'}
+
+        self.supervisor._chat_adapter = ChatAdapter()
+        store = FeishuStore(self.supervisor.database)
+        store.enqueue_message(FeishuInboundMessage(
+            event_id='event-surface', message_id='surface-message', chat_id='chat-surface', chat_type='p2p',
+            sender_open_id='user-1', sender_type='user', message_type='text', text='/surface chat',
+        ))
+        store.set_selected_surface('chat-surface', 'chat')
+        self.assertEqual(self._request('/api/v1/surfaces')['current_state']['selected'], 'chat')
+        response = self._request('/api/v1/surfaces/select', {'surface': 'code'})
+        self.assertEqual(response['status'], 'ok')
+        self.assertEqual(response['current_state']['selected'], 'code')
+        self.assertEqual(store.get_selected_surface('chat-surface'), 'code')
+
+    def test_surface_selection_rejects_unavailable_work_surface(self):
+        store = FeishuStore(self.supervisor.database)
+        store.enqueue_message(FeishuInboundMessage(
+            event_id='event-surface', message_id='surface-message', chat_id='chat-surface', chat_type='p2p',
+            sender_open_id='user-1', sender_type='user', message_type='text', text='hello',
+        ))
+        with self.assertRaises(HTTPError) as raised:
+            self._request('/api/v1/surfaces/select', {'surface': 'work'})
+        self.assertEqual(raised.exception.code, 409)
+        raised.exception.close()
 
     def test_settings_read_and_model_defaults_write_use_control_auth(self):
         self.server.read_model.settings = lambda: {'available': True, 'codex_model_defaults': {'applies_to': 'new_threads'}}
@@ -328,8 +499,20 @@ class LocalControlApiTests(unittest.TestCase):
         response = self._request('/api/v1/sessions')
         self.assertEqual(response['status'], 'ok')
         self.assertEqual(response['current_state'][0]['chat_id'], 'chat-1')
+        self.assertEqual(response['current_state'][0]['approval_mode'], 'ask')
         self.assertNotIn('owner_open_id', response['current_state'][0])
         self.assertNotIn('owner-secret', json.dumps(response))
+
+    def test_session_approval_mode_api_persists_native_presets(self):
+        store = FeishuStore(self.supervisor.database)
+        store.create_pending_session('chat/1', 'p2p', 'owner-1', 'C:/workspace')
+        path = f'/api/v1/sessions/{quote("chat/1", safe="")}/approval-mode'
+        for mode in ('ask', 'auto', 'full'):
+            response = self._request(path, {'mode': mode})
+            self.assertEqual(response['status'], 'ok')
+            self.assertEqual(store.get_approval_mode('chat/1'), mode)
+            session = next(item for item in response['current_state'] if item['chat_id'] == 'chat/1')
+            self.assertEqual(session['approval_mode'], mode)
 
     def test_session_unbind_api_removes_session(self):
         store = FeishuStore(self.supervisor.database)
@@ -348,6 +531,29 @@ class LocalControlApiTests(unittest.TestCase):
         self.assertEqual(self._request('/api/v1/sessions/chat-1/unbind', {})['status'], 'ok')
         self.assertIsNone(store.get_session('chat-1'))
         self.assertIsNotNone(bindings.get_binding('thread-1'))
+
+    def test_active_session_cannot_be_unbound_or_switch_surface_mid_turn(self):
+        store = FeishuStore(self.supervisor.database)
+        store.create_pending_session('chat-1', 'p2p', 'owner-1', 'C:/workspace')
+        store.bind_session('chat-1', 'thread-1')
+        bindings = BindingStore(self.supervisor.database)
+        bindings.upsert_binding(ThreadRef('thread-1', 'native thread', Path('C:/workspace')))
+        registry = ActiveTurnRegistry()
+        telemetry = registry.begin('message-private', thread_id='thread-1', received_at=1, queued_at=1, execution_started_at=1)
+        telemetry.set_identity(turn_id='turn-1')
+        telemetry.set_stage('running', status='running')
+        registry.register(ActiveTurn('thread-1', 'turn-1', object(), telemetry=telemetry))
+        self.supervisor._daemon = SimpleNamespace(adapter=SimpleNamespace(registry=registry))
+
+        unbind = self._request('/api/v1/sessions/chat-1/unbind', {})
+        self.assertEqual(unbind['error_code'], 'CONTROL_SESSION_ACTIVE')
+        self.assertIsNotNone(store.get_session('chat-1'))
+
+        with self.assertRaises(HTTPError) as raised:
+            self._request('/api/v1/surfaces/select', {'surface': 'chat', 'chat_id': 'chat-1'})
+        payload = json.loads(raised.exception.read())
+        self.assertEqual(payload['error_code'], 'CONTROL_SURFACE_CHANGE_BUSY')
+        raised.exception.close()
 
     def test_session_unbind_is_idempotent(self):
         first = self._request('/api/v1/sessions/missing-chat/unbind', {})
@@ -428,10 +634,13 @@ class LocalControlApiTests(unittest.TestCase):
         self.assertEqual(self._request('/api/v1/feishu/workspaces/remove', {'workspace_root': self.directory.name})['status'], 'ok')
         self.assertEqual(self._request('/api/v1/feishu/workspaces/remove', {'workspace_root': self.directory.name})['status'], 'ok')
 
-    def test_workspace_changes_fail_closed_while_running_or_pairing(self):
+    def test_workspace_changes_hot_reload_while_running_and_fail_closed_while_pairing(self):
         self.assertEqual(self._request('/api/v1/feishu/start', {})['status'], 'ok')
         running = self._request('/api/v1/feishu/workspaces/add', {'workspace_root': self.directory.name})
-        self.assertEqual(running['error_code'], 'CONTROL_FEISHU_STOP_REQUIRED_FOR_WORKSPACE_CHANGE')
+        self.assertEqual(running['status'], 'ok')
+        self.assertEqual(self.supervisor._daemon.settings.allowed_workspace_roots, (Path(self.directory.name).resolve(),))
+        removed = self._request('/api/v1/feishu/workspaces/remove', {'workspace_root': self.directory.name})
+        self.assertEqual(removed['error_code'], 'CONTROL_FEISHU_STOP_REQUIRED_FOR_WORKSPACE_CHANGE')
         self.assertEqual(self._request('/api/v1/feishu/stop', {})['status'], 'ok')
         self.assertEqual(self._request('/api/v1/feishu/pairing/start', {})['status'], 'ok')
         pairing = self._request('/api/v1/feishu/workspaces/add', {'workspace_root': self.directory.name})

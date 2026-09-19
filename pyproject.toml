@@ -1,8 +1,6 @@
 [project]
 name = "cfr"
 version = "0.1.0"
-description = "Local-first Feishu bridge for the native Codex runtime"
-readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 
@@ -14,6 +12,17 @@ feishu = [
     "lark-channel-sdk>=1,<2",
     "lark-oapi>=1.5.5,<2",
     "keyring>=25,<26",
+    # lark-channel-sdk uses websockets 15 for its persistent Channel
+    # connection.  When the host desktop/global proxy is SOCKS, websockets
+    # requires python-socks while requests needs PySocks for the endpoint
+    # handshake.  Keep both in the Feishu extra so a rebuilt CFR venv behaves
+    # the same way as the configured Linux desktop network without changing
+    # any host proxy settings.
+    "python-socks>=2,<3",
+    "PySocks>=1.7,<2",
+]
+desktop = [
+    "pywebview>=6,<7",
 ]
 
 [build-system]

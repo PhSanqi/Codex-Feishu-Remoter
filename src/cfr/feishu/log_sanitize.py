@@ -37,7 +37,11 @@ class FeishuLogSanitizer(logging.Filter):
     """Sanitize records emitted by the optional Feishu SDK before propagation."""
 
     def filter(self, record):
-        record.msg = sanitize_feishu_log_text(record.getMessage())
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        record.msg = sanitize_feishu_log_text(message)
         record.args = ()
         return True
 
@@ -52,3 +56,9 @@ def configure_feishu_sdk_logging(level_name: str = 'WARNING'):
         logger.setLevel(level)
         if not any(isinstance(item, FeishuLogSanitizer) for item in logger.filters):
             logger.addFilter(sanitizer)
+    # Logger filters are not re-applied by ancestor loggers during propagation.
+    # Root handlers therefore carry the same narrow token filter so SDK child
+    # loggers created after this call cannot bypass redaction.
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(item, FeishuLogSanitizer) for item in handler.filters):
+            handler.addFilter(sanitizer)

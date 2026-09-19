@@ -1,16 +1,68 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import unittest
 
 from cfr.control.read_model import ControlReadModel
 from cfr.core.models import ThreadRef
 from cfr.feishu.store import FeishuStore
+from cfr.feishu.credentials import LocalConfigStore
 from cfr.storage.db import BindingStore
 
 
 class ControlReadModelTests(unittest.TestCase):
+    def test_surfaces_uses_cached_chat_snapshot_without_invasive_health_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / 'cfr.sqlite3'
+            snapshot = Mock(return_value={'available': True, 'status': 'ready', 'description': 'cached'})
+            supervisor = SimpleNamespace(
+                chat_status_snapshot=snapshot,
+                _config_store=SimpleNamespace(get_default_surface=lambda: 'code'),
+            )
+            surfaces = ControlReadModel(supervisor, database).surfaces()
+        snapshot.assert_called_once_with()
+        self.assertIsNone(surfaces['chat_id'])
+        self.assertTrue(next(item for item in surfaces['data'] if item['id'] == 'chat')['available'])
+
+    def test_settings_cache_reloads_only_after_config_revision_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = LocalConfigStore(directory)
+            config.set_default_surface('code')
+            first, second = object(), object()
+            loader = Mock(side_effect=[first, second])
+            supervisor = SimpleNamespace(_config_store=config, _load_settings=loader)
+            model = ControlReadModel(supervisor, Path(directory) / 'cfr.sqlite3')
+            self.assertIs(model._settings(), first)
+            self.assertIs(model._settings(), first)
+            config.set_network_policy('direct')
+            self.assertIs(model._settings(), second)
+        self.assertEqual(loader.call_count, 2)
+
+    def test_tracked_settings_cache_does_not_reload_only_because_time_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = LocalConfigStore(directory)
+            config.set_default_surface('code')
+            value = object()
+            loader = Mock(return_value=value)
+            supervisor = SimpleNamespace(_config_store=config, _load_settings=loader)
+            model = ControlReadModel(supervisor, Path(directory) / 'cfr.sqlite3')
+            with patch('cfr.control.read_model.time.monotonic', side_effect=[0.0, 60.0]):
+                self.assertIs(model._settings(), value)
+                self.assertIs(model._settings(), value)
+        loader.assert_called_once_with()
+
+    def test_untracked_settings_loader_keeps_short_ttl(self):
+        first, second = object(), object()
+        loader = Mock(side_effect=[first, second])
+        supervisor = SimpleNamespace(_load_settings=loader)
+        model = ControlReadModel(supervisor, Path(':memory:'))
+        with patch('cfr.control.read_model.time.monotonic', side_effect=[0.0, 6.0]):
+            self.assertIs(model._settings(), first)
+            self.assertIs(model._settings(), second)
+        self.assertEqual(loader.call_count, 2)
+
     def test_read_model_uses_runtime_state_and_excludes_secret_value(self):
         supervisor = type('Supervisor', (), {
             'database': Path('cfr.sqlite3'),
@@ -78,6 +130,7 @@ class ControlReadModelTests(unittest.TestCase):
         self.assertEqual(sessions[0]['chat_id'], 'chat-1')
         self.assertEqual(sessions[0]['pending_cwd'], 'C:/workspace')
         self.assertIsNone(sessions[0]['thread_id'])
+        self.assertEqual(sessions[0]['approval_mode'], 'ask')
 
     def test_sessions_read_model_is_sanitized(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -87,6 +140,25 @@ class ControlReadModelTests(unittest.TestCase):
         self.assertNotIn('owner_open_id', sessions[0])
         self.assertNotIn('owner-secret', json.dumps(sessions))
 
+    def test_sessions_read_model_combines_code_chat_and_selected_surface(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / 'cfr.sqlite3'
+            store = FeishuStore(database)
+            store.create_pending_session('chat-1', 'p2p', 'owner-secret', directory)
+            store.update_pending_thread_settings('chat-1', model='gpt-test', reasoning_effort='medium')
+            store.set_selected_surface('chat-1', 'chat')
+            store.ensure_chat_binding('chat-1')
+            store.update_chat_binding('chat-1', tab_id='5', url='https://chatgpt.com/g/g-p-aabbcc-project/c/conv-1')
+            session = ControlReadModel(object(), database).sessions()[0]
+        self.assertEqual(session['selected_surface'], 'chat')
+        self.assertEqual(session['state'], 'pending_initial')
+        self.assertEqual(session['pending_settings']['model'], 'gpt-test')
+        self.assertEqual(session['chat_state'], 'conversation')
+        self.assertEqual(session['chat_tab_id'], '5')
+        self.assertEqual(session['chat_project_id'], 'g-p-aabbcc')
+        self.assertEqual(session['chat_conversation_id'], 'conv-1')
+        self.assertNotIn('owner-secret', json.dumps(session))
+
     def test_bindings_read_model_uses_durable_binding_store_without_rollout_content(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / 'cfr.sqlite3'
@@ -95,3 +167,37 @@ class ControlReadModelTests(unittest.TestCase):
         self.assertEqual(bindings[0]['thread_id'], 'thread-1')
         self.assertEqual(bindings[0]['thread_name'], 'native thread')
         self.assertNotIn('rollout_path', bindings[0])
+
+    def test_expensive_codex_catalog_reads_are_short_lived_cached(self):
+        model = ControlReadModel(object(), Path('unused.sqlite3'))
+        with patch('cfr.control.read_model.codex_models', return_value={'available': True, 'data': []}) as models, patch(
+            'cfr.control.read_model.codex_capabilities', return_value={'context': 'default'}
+        ) as capabilities, patch(
+            'cfr.control.read_model.codex_settings', return_value={'available': True}
+        ) as settings:
+            self.assertIs(model.models(), model.models())
+            self.assertIs(model.capabilities(), model.capabilities())
+            self.assertIs(model.settings(), model.settings())
+        self.assertEqual(models.call_count, 1)
+        self.assertEqual(capabilities.call_count, 1)
+        self.assertEqual(settings.call_count, 1)
+
+    def test_model_default_write_invalidates_only_settings_cache(self):
+        model = ControlReadModel(object(), Path('unused.sqlite3'))
+        with patch('cfr.control.read_model.codex_settings', side_effect=[{'revision': 1}, {'revision': 2}]) as settings, patch(
+            'cfr.control.read_model.write_codex_settings', return_value={'status': 'ok'}
+        ):
+            self.assertEqual(model.settings()['revision'], 1)
+            self.assertEqual(model.write_model_defaults({})['status'], 'ok')
+            self.assertEqual(model.settings()['revision'], 2)
+        self.assertEqual(settings.call_count, 2)
+
+    def test_bindings_read_model_marks_current_feishu_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / 'cfr.sqlite3'
+            BindingStore(database).upsert_binding(ThreadRef('thread-1', 'native thread', Path(directory)))
+            store = FeishuStore(database)
+            store.create_pending_session('chat-1', 'p2p', 'owner-1', directory)
+            store.bind_session('chat-1', 'thread-1')
+            binding = ControlReadModel(object(), database).bindings()[0]
+        self.assertEqual(binding['bound_chat_id'], 'chat-1')

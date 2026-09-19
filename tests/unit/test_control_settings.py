@@ -48,6 +48,35 @@ def _config(model='runtime-model', reasoning='custom-a', tier='runtime-tier'):
 
 
 class CodexSettingsTests(unittest.TestCase):
+    def test_future_runtime_model_and_new_reasoning_effort_need_no_cfr_model_patch(self):
+        astra = {
+            'id': 'gpt-6-astra', 'model': 'gpt-6-astra', 'displayName': 'GPT-6 Astra',
+            'description': 'future runtime model', 'isDefault': True,
+            'defaultReasoningEffort': 'high',
+            'supportedReasoningEfforts': [
+                {'reasoningEffort': value, 'description': value}
+                for value in ('low', 'medium', 'high', 'xhigh', 'max')
+            ],
+            'serviceTiers': [],
+        }
+        client = _Client({
+            'model/list': [
+                {'data': [astra], 'nextCursor': None},
+                {'data': [astra], 'nextCursor': None},
+            ],
+            'config/batchWrite': {'status': 'ok', 'version': 'v-next'},
+            'config/read': _config(model='gpt-6-astra', reasoning='max', tier=None),
+            'configRequirements/read': {'requirements': None},
+        })
+        result = write(
+            {'model': 'gpt-6-astra', 'reasoning_effort': 'max', 'service_tier': None},
+            _factory(client),
+        )
+        edits = next(params['edits'] for method, params, _ in client.requests if method == 'config/batchWrite')
+        self.assertEqual([edit['value'] for edit in edits], ['gpt-6-astra', 'max', None])
+        self.assertEqual(result['current_state']['codex_model_defaults']['model']['effective_value'], 'gpt-6-astra')
+        self.assertEqual(result['current_state']['codex_model_defaults']['reasoning_effort']['effective_value'], 'max')
+
     def test_read_projects_effective_values_and_sanitized_sources(self):
         client = _Client({
             'config/read': _config(),

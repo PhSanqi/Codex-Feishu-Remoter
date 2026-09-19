@@ -1,6 +1,9 @@
 @echo off
 cd /d "%~dp0"
 
+echo [CFR] Starting Control Center, dedicated ChatGPT browser, and Feishu runtime.
+echo [CFR] One CFR process owns them; stopping CFR also stops its Feishu and browser runtimes.
+
 python --version >nul 2>&1
 if errorlevel 1 (
   py -3 --version >nul 2>&1
