@@ -138,7 +138,7 @@ class ChatBrowserRuntimeTests(unittest.TestCase):
         self.assertEqual(state['effective_backend'], 'shared')
         self.assertTrue(state['shared']['authenticated'])
         self.assertTrue(state['ready'])
-        self.assertEqual(state['profile_dir'], '/home/test/.config/google-chrome/Default')
+        self.assertEqual(Path(state['profile_dir']).as_posix(), '/home/test/.config/google-chrome/Default')
 
     def test_linux_setup_migrates_stale_embedded_preference_to_shared(self):
         with tempfile.TemporaryDirectory() as directory, patch('cfr.chat.resolve_cfr_config_dir', return_value=Path(directory)), patch(
